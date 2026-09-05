@@ -16,8 +16,9 @@ Gmail filters decide **which conversations receive a retention policy**. Retenti
 - Retention policies expressed in minutes, hours, days, weeks, calendar months, or calendar years
 - Policies applied manually, through Gmail filters, or in bulk
 - Managed schedules and manual **Run Now** processing
-- Gmail sidebar with status, schedule controls, and basic settings
-- Private administration page for complete configuration and diagnostics
+- Gmail sidebar with status, live scan progress, and complete settings
+- Native card pages for rules, schedules, notifications, labels, backups,
+  filter cleanup, and diagnostics
 - Automatic handling of multiple retention labels
 - Message-level processing for conversations containing both active and trashed messages
 - Deletion summaries with direct links to conversations in Gmail Trash
@@ -42,10 +43,9 @@ The scan schedule determines when expiration is checked. A seven-day policy does
 
 Retention Manager is currently available as a manual Google Apps Script installation.
 
-The installation requires three files from the same published release:
+The installation requires two files from the same published release:
 
 - `retention-manager.gs`
-- `admin.html`
 - `appsscript.json`
 
 Follow the complete [Installation Guide](https://github.com/dynamiccookies/Retention-Manager-for-Gmail/wiki/Installation).

@@ -1,6 +1,6 @@
 /**
  * Retention Manager for Gmail™
- * Enforces Gmail label-based retention policies and provides Gmail and web UIs.
+ * Enforces Gmail label-based retention policies from a native Gmail add-on UI.
  * Documentation: https://github.com/dynamiccookies/retention-manager-for-gmail
  */
 
@@ -24,6 +24,9 @@ const RETENTION_FACTORY_DEFAULTS = Object.freeze({
 
   // Remove directly retention-labeled messages from Inbox on the next scan.
   ARCHIVE_ON_LABEL: false,
+
+  // Never move a starred active message to Trash when its policy expires.
+  PROTECT_STARRED_MESSAGES: true,
 
   // Child-label values created only when ROOT_LABEL does not exist at all.
   DEFAULT_RETENTION_LABEL_SUFFIXES: Object.freeze(['7d', '1m']),
@@ -52,7 +55,7 @@ const RETENTION_FACTORY_DEFAULTS = Object.freeze({
  * settings migrations without tying them to a particular software release.
  */
 const RETENTION_SETTINGS_PROPERTY_KEY = 'GMAIL_RETENTION_CONFIG';
-const RETENTION_SETTINGS_SCHEMA_VERSION = 4;
+const RETENTION_SETTINGS_SCHEMA_VERSION = 5;
 const RETENTION_SETTINGS_BACKUPS_PROPERTY_KEY =
   'GMAIL_RETENTION_CONFIG_BACKUPS';
 const RETENTION_SETTINGS_BACKUP_STORE_SCHEMA_VERSION = 1;
@@ -77,7 +80,7 @@ const RETENTION_UPDATE_NOTIFICATION_STATE_SCHEMA_VERSION = 1;
 const RETENTION_UPDATE_NOTIFICATION_HISTORY_LIMIT = 25;
 const RETENTION_PENDING_SYSTEM_EMAILS_PROPERTY_KEY =
   'GMAIL_RETENTION_PENDING_SYSTEM_EMAILS';
-const RETENTION_PENDING_SYSTEM_EMAILS_SCHEMA_VERSION = 1;
+const RETENTION_PENDING_SYSTEM_EMAILS_SCHEMA_VERSION = 2;
 const RETENTION_DELETION_OUTBOX_PROPERTY_KEY =
   'GMAIL_RETENTION_DELETION_REPORT_OUTBOX';
 const RETENTION_DELETION_OUTBOX_CHUNK_PREFIX =
@@ -85,16 +88,11 @@ const RETENTION_DELETION_OUTBOX_CHUNK_PREFIX =
 const RETENTION_DELETION_OUTBOX_SCHEMA_VERSION = 1;
 const RETENTION_DELETION_OUTBOX_CHUNK_SIZE = 7500;
 const RETENTION_DELETION_OUTBOX_MAX_ENCODED_CHARACTERS = 175000;
-const RETENTION_ADMIN_PREFERENCES_PROPERTY_KEY =
-  'GMAIL_RETENTION_ADMIN_PREFERENCES';
-const RETENTION_ADMIN_PAGE_URL_PROPERTY_KEY =
-  'GMAIL_RETENTION_ADMIN_PAGE_URL';
 const RETENTION_SIDEBAR_RUN_PROPERTY_KEY =
   'GMAIL_RETENTION_SIDEBAR_RUN_REQUEST';
 const RETENTION_CONTINUATION_PROPERTY_KEY =
   'GMAIL_RETENTION_CONTINUATION_STATE';
-const RETENTION_CONTINUATION_SCHEMA_VERSION = 2;
-const RETENTION_CONTINUATION_HANDLER = 'continueGmailRetention';
+const RETENTION_CONTINUATION_SCHEMA_VERSION = 4;
 const RETENTION_FILTER_CLEANUP_HISTORY_PROPERTY_KEY =
   'GMAIL_RETENTION_FILTER_CLEANUP_HISTORY';
 const RETENTION_FILTER_CLEANUP_HISTORY_SCHEMA_VERSION = 1;
@@ -102,10 +100,6 @@ const RETENTION_FILTER_CLEANUP_HISTORY_LIMIT = 5;
 const RETENTION_FILTER_CLEANUP_PROPERTY_CHUNK_SIZE = 7500;
 const RETENTION_FILTER_CLEANUP_MAX_FILTERS_PER_MERGE = 25;
 const RETENTION_FILTER_CLEANUP_MAX_QUERY_LENGTH = 1500;
-const RETENTION_ADMIN_PREFERENCES_SCHEMA_VERSION = 1;
-const RETENTION_ADMIN_FACTORY_PREFERENCES = Object.freeze({
-  theme: 'dark',
-});
 
 /*
  * Gmail accepts only predefined label colors. Each option pairs an allowed
@@ -212,11 +206,11 @@ const RETENTION_SCHEDULE_FREQUENCIES = Object.freeze({
  */
 const RETENTION_CONFIG = Object.freeze({
 
-  // User-facing application name used by the add-on, admin page, and emails.
+  // User-facing application name used by the Gmail add-on and emails.
   APPLICATION_NAME: 'Retention Manager for Gmail™',
 
   // Displayed in notification footers and linked to the matching GitHub release.
-  VERSION: '0.7.1',
+  VERSION: '0.8.0',
   PROJECT_REPOSITORY_URL:
     'https://github.com/dynamiccookies/retention-manager-for-gmail',
 
@@ -240,8 +234,6 @@ const RETENTION_CONFIG = Object.freeze({
     y: 'y', yr: 'y', yrs: 'y', year: 'y', years: 'y',
   }),
 
-  // Gmail Apps Script methods are safest when processed in moderate batches.
-  THREAD_PAGE_SIZE: 100,
   // threads.get currently costs 40 of Gmail's 6,000 per-user quota units.
   // Fifty reads leave headroom for labels, Trash operations, and notifications.
   THREAD_PROCESSING_BATCH_SIZE: 50,
@@ -251,8 +243,6 @@ const RETENTION_CONFIG = Object.freeze({
   MIN_QUOTA_PAUSE_MS: 30 * 1000,
   // Leave time for result persistence before Apps Script's execution ceiling.
   MAX_INLINE_SCAN_RUNTIME_MS: 5 * 60 * 1000,
-  // Installed add-ons may not create clock triggers less than one hour apart.
-  RUNTIME_CONTINUATION_DELAY_MS: 60 * 60 * 1000,
   // Large deletion runs are split into multiple complete summary messages.
   MAX_ROWS_PER_NOTIFICATION: 200,
 
@@ -261,105 +251,93 @@ const RETENTION_CONFIG = Object.freeze({
 });
 
 /*
- * Gmail API compatibility objects keep the retention algorithm readable while
- * allowing the project to use gmail.modify instead of the broader
- * https://mail.google.com/ scope required by the built-in GmailApp service.
+ * Direct Gmail API data access. The retention engine uses raw label, thread,
+ * and message resources so every network operation and quota-bearing call is
+ * explicit.
  */
-let gmailApiUserLabelCache = null;
-const gmailApiThreadCache = new Map();
-const gmailApiLabelThreadIdCache = new Map();
+let gmailUserLabelCache = null;
+const gmailThreadCache = new Map();
+const gmailCandidateThreadIdCache = new Map();
 
-function invalidateGmailApiCaches_() {
-  gmailApiUserLabelCache = null;
-  gmailApiThreadCache.clear();
-  gmailApiLabelThreadIdCache.clear();
+function invalidateGmailCaches_() {
+  gmailUserLabelCache = null;
+  gmailThreadCache.clear();
+  gmailCandidateThreadIdCache.clear();
 }
 
-function getGmailApiUserLabels_() {
-  if (gmailApiUserLabelCache) {
-    return gmailApiUserLabelCache;
+function getGmailUserLabels_() {
+  if (!gmailUserLabelCache) {
+    const response = Gmail.Users.Labels.list('me') || {};
+    gmailUserLabelCache = (Array.isArray(response.labels) ? response.labels : [])
+      .filter(label => label && label.type !== 'system');
   }
-  const response = Gmail.Users.Labels.list('me') || {};
-  gmailApiUserLabelCache = (Array.isArray(response.labels) ? response.labels : [])
-    .filter(label => label && label.type !== 'system')
-    .map(createGmailApiLabel_);
-  return gmailApiUserLabelCache;
+  return gmailUserLabelCache;
 }
 
-function createGmailApiLabel_(resource) {
-  return {
-    getId: () => resource.id,
-    getName: () => resource.name,
-    getThreads: (start, max) => listGmailApiLabelThreads_(
-      resource.id,
-      start,
-      max,
-    ),
-    addToThread: thread => {
-      Gmail.Users.Threads.modify(
-        { addLabelIds: [resource.id] },
-        'me',
-        thread.getId(),
-      );
-      gmailApiThreadCache.delete(thread.getId());
-      gmailApiLabelThreadIdCache.delete(resource.id);
-      return thread;
-    },
-    removeFromThread: thread => {
-      Gmail.Users.Threads.modify(
-        { removeLabelIds: [resource.id] },
-        'me',
-        thread.getId(),
-      );
-      gmailApiThreadCache.delete(thread.getId());
-      gmailApiLabelThreadIdCache.delete(resource.id);
-      return thread;
-    },
-    deleteLabel: () => {
-      Gmail.Users.Labels.remove('me', resource.id);
-      invalidateGmailApiCaches_();
-    },
-  };
+function getGmailUserLabelByName_(labelName) {
+  const target = normalizeRetentionLabelName(labelName).toLowerCase();
+  return getGmailUserLabels_().find(label =>
+    normalizeRetentionLabelName(label.name).toLowerCase() === target,
+  ) || null;
 }
 
-function listGmailApiLabelThreads_(labelId, start, max) {
-  const targetCount = Math.max(0, start) + Math.max(0, max);
-  const state = gmailApiLabelThreadIdCache.get(labelId) || {
-    ids: [],
-    idSet: new Set(),
-    nextPageToken: null,
-    complete: false,
-  };
-  if (!state.idSet) {
-    state.idSet = new Set(state.ids);
+function createGmailLabel_(labelName) {
+  const label = Gmail.Users.Labels.create(
+    {
+      name: normalizeRetentionLabelName(labelName),
+      labelListVisibility: 'labelShow',
+      messageListVisibility: 'show',
+    },
+    'me',
+  );
+  invalidateGmailCaches_();
+  return label;
+}
+
+/** Lists thread IDs for one label, optionally constrained by Gmail search. */
+function listGmailThreadIds_(labelId, query, limit) {
+  const ids = [];
+  const seen = new Set();
+  let pageToken = null;
+  const maximum = Number.isFinite(limit) ? Math.max(0, limit) : Infinity;
+  if (maximum === 0) {
+    return ids;
   }
-
-  while (!state.complete && state.ids.length < targetCount) {
+  do {
     const options = {
       labelIds: [labelId],
       includeSpamTrash: true,
-      maxResults: Math.min(500, Math.max(1, targetCount - state.ids.length)),
+      maxResults: Math.min(500, maximum - ids.length),
     };
-    if (state.nextPageToken) {
-      options.pageToken = state.nextPageToken;
+    if (query) {
+      options.q = query;
+    }
+    if (pageToken) {
+      options.pageToken = pageToken;
     }
     const response = Gmail.Users.Threads.list('me', options) || {};
-    if (Array.isArray(response.threads)) {
-      response.threads.forEach(resource => {
-        if (resource && resource.id && !state.idSet.has(resource.id)) {
-          state.ids.push(resource.id);
-          state.idSet.add(resource.id);
-        }
-      });
-    }
-    state.nextPageToken = response.nextPageToken || null;
-    state.complete = !state.nextPageToken;
-  }
-  gmailApiLabelThreadIdCache.set(labelId, state);
+    (Array.isArray(response.threads) ? response.threads : []).forEach(thread => {
+      if (thread && thread.id && !seen.has(thread.id) && ids.length < maximum) {
+        seen.add(thread.id);
+        ids.push(thread.id);
+      }
+    });
+    pageToken = ids.length < maximum ? response.nextPageToken || null : null;
+  } while (pageToken);
+  return ids;
+}
 
-  return state.ids
-    .slice(start, start + max)
-    .map(createGmailApiThread_);
+/** Lists only threads that Gmail identifies as older than one policy cutoff. */
+function listGmailCandidateThreadIds_(labelId, cutoff) {
+  const cutoffSeconds = Math.floor(cutoff.getTime() / 1000) + 1;
+  const cacheKey = `${labelId}:${cutoffSeconds}`;
+  if (!gmailCandidateThreadIdCache.has(cacheKey)) {
+    gmailCandidateThreadIdCache.set(
+      cacheKey,
+      listGmailThreadIds_(labelId, `before:${cutoffSeconds}`),
+    );
+  }
+  return gmailCandidateThreadIdCache.get(cacheKey).slice();
 }
 
 /** Runs one idempotent Gmail operation with bounded transient-failure retries. */
@@ -379,39 +357,27 @@ function executeGmailApiWithRetry_(operation) {
       if (!retryable || attempt === 3) {
         break;
       }
-      Utilities.sleep((2 ** (attempt - 1)) * 1000 + Math.floor(Math.random() * 1000));
+      Utilities.sleep((2 ** (attempt - 1)) * 1000 +
+        Math.floor(Math.random() * 1000));
     }
   }
   throw lastError;
 }
 
-/** Returns whether Gmail rejected a request against a time-based API quota. */
 function isGmailApiQuotaError_(error) {
   return /quota exceeded|quota metric|units per minute|total query cost/i.test(
     getRuntimeErrorMessage(error),
   );
 }
 
-/** Runs one Gmail read with bounded retries for transient API failures. */
-function executeGmailApiReadWithRetry_(operation) {
-  return executeGmailApiWithRetry_(operation);
-}
-
-/** Verifies the metadata required by the retention calculation. */
-function validateGmailApiThreadResource_(resource, threadId) {
-  const messages = resource && Array.isArray(resource.messages)
-    ? resource.messages
-    : [];
+function validateGmailThread_(thread, threadId) {
+  const messages = thread && Array.isArray(thread.messages) ? thread.messages : [];
   if (messages.length === 0) {
     throw new Error('Gmail returned a conversation without any messages.');
   }
   messages.forEach(message => {
     if (
-      !message ||
-      typeof message.id !== 'string' ||
-      !message.id ||
-      typeof message.threadId !== 'string' ||
-      message.threadId !== threadId ||
+      !message || !message.id || message.threadId !== threadId ||
       !Number.isFinite(Number(message.internalDate))
     ) {
       throw new Error(
@@ -419,170 +385,91 @@ function validateGmailApiThreadResource_(resource, threadId) {
       );
     }
   });
-  return resource;
+  return thread;
 }
 
-/**
- * Reads a thread without message bodies. If Gmail cannot construct thread-level
- * metadata, falls back to a minimal thread plus individual message metadata.
- */
-function readGmailApiThreadResource_(threadId) {
+/** Reads one thread without bodies, with a message-level metadata fallback. */
+function readGmailThread_(threadId) {
   let metadataError = null;
   try {
-    const metadataThread = executeGmailApiReadWithRetry_(() =>
+    return validateGmailThread_(executeGmailApiWithRetry_(() =>
       Gmail.Users.Threads.get('me', threadId, {
         format: 'metadata',
         metadataHeaders: ['Subject', 'From'],
       }),
-    );
-    return validateGmailApiThreadResource_(metadataThread, threadId);
+    ), threadId);
   } catch (error) {
     metadataError = error;
     if (isGmailApiQuotaError_(error)) {
       throw error;
     }
-    verboseLog('THREAD METADATA READ FALLBACK', () => ({
-      threadId,
-      error: getRuntimeErrorMessage(error),
-    }));
   }
 
   try {
-    const minimalThread = executeGmailApiReadWithRetry_(() =>
+    const minimal = executeGmailApiWithRetry_(() =>
       Gmail.Users.Threads.get('me', threadId, { format: 'minimal' }),
     );
-    const minimalMessages = Array.isArray(minimalThread.messages)
-      ? minimalThread.messages
-      : [];
-    const messages = minimalMessages.map(message => {
-      if (!message || !message.id) {
-        throw new Error('Gmail returned a thread message without an ID.');
-      }
-      return executeGmailApiReadWithRetry_(() =>
+    const messages = (Array.isArray(minimal.messages) ? minimal.messages : [])
+      .map(message => executeGmailApiWithRetry_(() =>
         Gmail.Users.Messages.get('me', message.id, {
           format: 'metadata',
           metadataHeaders: ['Subject', 'From'],
         }),
-      );
-    });
-    return validateGmailApiThreadResource_(
-      { ...minimalThread, messages },
-      threadId,
-    );
+      ));
+    return validateGmailThread_({ ...minimal, messages }, threadId);
   } catch (fallbackError) {
-    const wrappedError = new Error(
-      `Unable to read Gmail conversation ${threadId} after metadata and ` +
-        `minimal-message attempts. Metadata error: ` +
-        `${getRuntimeErrorMessage(metadataError)} Fallback error: ` +
-        `${getRuntimeErrorMessage(fallbackError)}`,
+    throw new Error(
+      `Unable to read Gmail conversation ${threadId}. Metadata error: ` +
+      `${getRuntimeErrorMessage(metadataError)} Fallback error: ` +
+      getRuntimeErrorMessage(fallbackError),
     );
-    throw wrappedError;
   }
 }
 
-function getGmailApiThreadResource_(threadId, refresh) {
-  if (!refresh && gmailApiThreadCache.has(threadId)) {
-    return gmailApiThreadCache.get(threadId);
+function getGmailThread_(threadId, refresh = false) {
+  if (refresh || !gmailThreadCache.has(threadId)) {
+    gmailThreadCache.set(threadId, readGmailThread_(threadId));
   }
-  const resource = readGmailApiThreadResource_(threadId);
-  gmailApiThreadCache.set(threadId, resource);
-  return resource;
+  return gmailThreadCache.get(threadId);
 }
 
-function createGmailApiThread_(threadId) {
-  const discoveryLabelNames = new Set();
-  return {
-    getId: () => threadId,
-    addDiscoveryLabelName_: labelName => discoveryLabelNames.add(labelName),
-    getDiscoveryLabelNames_: () => [...discoveryLabelNames],
-    getMessages: () => {
-      const resource = getGmailApiThreadResource_(threadId, false);
-      return (Array.isArray(resource.messages) ? resource.messages : [])
-        .map(createGmailApiMessage_);
-    },
-    getLabels: () => {
-      const resource = getGmailApiThreadResource_(threadId, false);
-      const labelIds = new Set();
-      (Array.isArray(resource.messages) ? resource.messages : [])
-        .forEach(message => {
-          (Array.isArray(message.labelIds) ? message.labelIds : [])
-            .forEach(labelId => labelIds.add(labelId));
-        });
-      return getGmailApiUserLabels_().filter(label => labelIds.has(label.getId()));
-    },
-    isInTrash: () => {
-      const resource = getGmailApiThreadResource_(threadId, false);
-      return (Array.isArray(resource.messages) ? resource.messages : [])
-        .some(message =>
-          Array.isArray(message.labelIds) &&
-            message.labelIds.includes('TRASH'),
-        );
-    },
-    getPermalink: () => `https://mail.google.com/mail/u/0/#all/${threadId}`,
-    moveToInbox: () => {
-      try {
-        Gmail.Users.Threads.untrash('me', threadId);
-      } catch (error) {
-        verboseLog('THREAD UNTRASH SKIPPED', () => ({
-          threadId,
-          error: error.message,
-        }));
-      }
-      Gmail.Users.Threads.modify(
-        { addLabelIds: ['INBOX'], removeLabelIds: ['SPAM'] },
-        'me',
-        threadId,
-      );
-      gmailApiThreadCache.delete(threadId);
-      return createGmailApiThread_(threadId);
-    },
-    markUnread: () => {
-      Gmail.Users.Threads.modify(
-        { addLabelIds: ['UNREAD'] },
-        'me',
-        threadId,
-      );
-      gmailApiThreadCache.delete(threadId);
-      return createGmailApiThread_(threadId);
-    },
-    moveToTrash: () => {
-      Gmail.Users.Threads.trash('me', threadId);
-      gmailApiThreadCache.delete(threadId);
-      return createGmailApiThread_(threadId);
-    },
-  };
-}
-
-function getGmailApiHeader_(resource, headerName) {
-  const headers = resource && resource.payload &&
-      Array.isArray(resource.payload.headers)
-    ? resource.payload.headers
+function getGmailHeader_(message, headerName) {
+  const headers = message && message.payload &&
+      Array.isArray(message.payload.headers)
+    ? message.payload.headers
     : [];
   const header = headers.find(item =>
     item && typeof item.name === 'string' &&
-      item.name.toLowerCase() === headerName.toLowerCase(),
+    item.name.toLowerCase() === headerName.toLowerCase(),
   );
   return header && typeof header.value === 'string' ? header.value : '';
 }
 
-function createGmailApiMessage_(resource) {
-  return {
-    getId: () => resource.id,
-    getThread: () => createGmailApiThread_(resource.threadId),
-    getDate: () => new Date(Number(resource.internalDate)),
-    getSubject: () => getGmailApiHeader_(resource, 'Subject'),
-    getFrom: () => getGmailApiHeader_(resource, 'From'),
-    isInTrash: () =>
-      Array.isArray(resource.labelIds) && resource.labelIds.includes('TRASH'),
-    moveToTrash: () => {
-      Gmail.Users.Messages.trash('me', resource.id);
-      resource.labelIds = Array.isArray(resource.labelIds)
-        ? [...new Set([...resource.labelIds, 'TRASH'])]
-        : ['TRASH'];
-      gmailApiThreadCache.delete(resource.threadId);
-      return createGmailApiMessage_(resource);
-    },
-  };
+function getThreadUserLabels_(thread) {
+  const labelIds = new Set();
+  (Array.isArray(thread.messages) ? thread.messages : []).forEach(message =>
+    (Array.isArray(message.labelIds) ? message.labelIds : [])
+      .forEach(labelId => labelIds.add(labelId)),
+  );
+  return getGmailUserLabels_().filter(label => labelIds.has(label.id));
+}
+
+function messageHasLabel_(message, labelId) {
+  return Array.isArray(message.labelIds) && message.labelIds.includes(labelId);
+}
+
+function modifyThreadLabels_(threadId, addLabelIds = [], removeLabelIds = []) {
+  executeGmailApiWithRetry_(() => Gmail.Users.Threads.modify(
+    { addLabelIds, removeLabelIds },
+    'me',
+    threadId,
+  ));
+  gmailThreadCache.delete(threadId);
+}
+
+function removeGmailLabel_(labelId) {
+  Gmail.Users.Labels.remove('me', labelId);
+  invalidateGmailCaches_();
 }
 
 function encodeMimeHeader_(value) {
@@ -592,7 +479,7 @@ function encodeMimeHeader_(value) {
   )}?=`;
 }
 
-function buildGmailApiMimeMessage_(recipient, subject, plainBody, options) {
+function sendGmailMessage_(recipient, subject, plainBody, options) {
   const boundary = `retention_${Utilities.getUuid().replace(/-/g, '')}`;
   const senderName = options && options.name
     ? options.name
@@ -604,7 +491,7 @@ function buildGmailApiMimeMessage_(recipient, subject, plainBody, options) {
     String(value),
     Utilities.Charset.UTF_8,
   );
-  return [
+  const mimeMessage = [
     `From: ${encodeMimeHeader_(senderName)} <${recipient}>`,
     `To: ${recipient}`,
     `Subject: ${encodeMimeHeader_(subject)}`,
@@ -624,44 +511,14 @@ function buildGmailApiMimeMessage_(recipient, subject, plainBody, options) {
     `--${boundary}--`,
     '',
   ].join('\r\n');
+  const raw = Utilities.base64EncodeWebSafe(
+    mimeMessage,
+    Utilities.Charset.UTF_8,
+  ).replace(/=+$/g, '');
+  const message = Gmail.Users.Messages.send({ raw }, 'me');
+  gmailThreadCache.delete(message.threadId);
+  return message;
 }
-
-const GmailApiApp = Object.freeze({
-  getUserLabels: () => getGmailApiUserLabels_().slice(),
-  getUserLabelByName: labelName => {
-    const target = normalizeRetentionLabelName(labelName).toLowerCase();
-    return getGmailApiUserLabels_().find(label =>
-      normalizeRetentionLabelName(label.getName()).toLowerCase() === target,
-    ) || null;
-  },
-  createLabel: labelName => {
-    const resource = Gmail.Users.Labels.create(
-      {
-        name: normalizeRetentionLabelName(labelName),
-        labelListVisibility: 'labelShow',
-        messageListVisibility: 'show',
-      },
-      'me',
-    );
-    invalidateGmailApiCaches_();
-    return createGmailApiLabel_(resource);
-  },
-  sendMessage: (recipient, subject, plainBody, options) => {
-    const mimeMessage = buildGmailApiMimeMessage_(
-      recipient,
-      subject,
-      plainBody,
-      options,
-    );
-    const raw = Utilities.base64EncodeWebSafe(
-      mimeMessage,
-      Utilities.Charset.UTF_8,
-    ).replace(/=+$/g, '');
-    const resource = Gmail.Users.Messages.send({ raw }, 'me');
-    gmailApiThreadCache.delete(resource.threadId);
-    return createGmailApiMessage_(resource);
-  },
-});
 
 /* Cached only for the current Apps Script execution. */
 let retentionSettingsCache = null;
@@ -692,24 +549,6 @@ function copyRetentionSettings(settings) {
       ...settings.DEFAULT_RETENTION_LABEL_SUFFIXES,
     ],
   };
-}
-
-/** Compares every recognized setting without depending on JSON key order. */
-function retentionSettingsEqual(first, second) {
-  if (!first || !second) {
-    return false;
-  }
-  return Object.keys(RETENTION_FACTORY_DEFAULTS).every(key => {
-    const firstValue = first[key];
-    const secondValue = second[key];
-    if (Array.isArray(firstValue) || Array.isArray(secondValue)) {
-      return Array.isArray(firstValue) &&
-        Array.isArray(secondValue) &&
-        firstValue.length === secondValue.length &&
-        firstValue.every((value, index) => value === secondValue[index]);
-    }
-    return firstValue === secondValue;
-  });
 }
 
 /**
@@ -858,6 +697,9 @@ function validateRetentionSettings(settings) {
   if (typeof settings.ARCHIVE_ON_LABEL !== 'boolean') {
     throw new Error('ARCHIVE_ON_LABEL must be true or false.');
   }
+  if (typeof settings.PROTECT_STARRED_MESSAGES !== 'boolean') {
+    throw new Error('PROTECT_STARRED_MESSAGES must be true or false.');
+  }
   if (!Array.isArray(settings.DEFAULT_RETENTION_LABEL_SUFFIXES)) {
     throw new Error('DEFAULT_RETENTION_LABEL_SUFFIXES must be an array.');
   }
@@ -910,6 +752,7 @@ function validateRetentionSettings(settings) {
     VERBOSE_LOGGING: settings.VERBOSE_LOGGING,
     ROOT_LABEL: rootLabel,
     ARCHIVE_ON_LABEL: settings.ARCHIVE_ON_LABEL,
+    PROTECT_STARRED_MESSAGES: settings.PROTECT_STARRED_MESSAGES,
     DEFAULT_RETENTION_LABEL_SUFFIXES: defaultSuffixes,
     NOTIFICATION_SUBJECT_PREFIX: settings.NOTIFICATION_SUBJECT_PREFIX.trim(),
     NOTIFICATION_RETENTION_LABEL_SUFFIX: notificationRetentionSuffix,
@@ -1018,6 +861,18 @@ function migrateRetentionConfiguration(storedConfiguration) {
           },
         };
         schemaVersion = 4;
+        migrated = true;
+        break;
+      }
+      case 4: {
+        configuration = {
+          schemaVersion: 5,
+          settings: {
+            ...configuration.settings,
+            PROTECT_STARRED_MESSAGES: true,
+          },
+        };
+        schemaVersion = 5;
         migrated = true;
         break;
       }
@@ -1195,11 +1050,11 @@ function renameRetentionRootLabelTree(oldRoot, newRoot) {
       .forEach(mapping => patchLabelName(mapping, mapping.targetName));
   } catch (error) {
     rollback();
-    invalidateGmailApiCaches_();
+    invalidateGmailCaches_();
     throw new Error(`Unable to rename the root Gmail label: ${error.message}`);
   }
 
-  invalidateGmailApiCaches_();
+  invalidateGmailCaches_();
   return { renamedLabelCount: mappings.length };
 }
 
@@ -1277,7 +1132,7 @@ function getRetentionSettings() {
 }
 
 /**
- * Returns the versioned active configuration for the admin interface.
+ * Returns the versioned active configuration used by settings backups.
  *
  * @return {{schemaVersion: number, settings: Object}} Detached configuration.
  */
@@ -1378,7 +1233,7 @@ function getRetentionSettingsBackupSortTime(backup) {
 
 /**
  * Reads and validates the rolling backup store. A fully corrupted store is
- * reported to the admin page but blocks writes so recoverable data is not
+ * reported to the settings card but blocks writes so recoverable data is not
  * silently overwritten. Individual invalid records are omitted and reported.
  *
  * @param {boolean=} strict Whether storage errors should be thrown.
@@ -1523,11 +1378,11 @@ function createRetentionSettingsBackupFromConfiguration(reason, configuration) {
 }
 
 /**
- * Returns backup metadata and settings previews for the private admin page.
+ * Returns backup metadata and settings previews for the Gmail card.
  *
  * @return {Object} Backup list and storage diagnostics.
  */
-function getRetentionSettingsBackupsForAdmin() {
+function getRetentionSettingsBackups() {
   const store = getRetentionSettingsBackupStore(false);
   let warning = store.storageError;
 
@@ -1582,8 +1437,8 @@ function getRetentionSettingsBackupById(backupId) {
  * @param {Object} request JSON file contents.
  * @return {Object} Refreshed backups and imported backup ID.
  */
-function importRetentionSettingsBackupFromAdmin(request) {
-  assertAdminOwnerAccess();
+function importRetentionSettingsBackup(request) {
+  assertInstallationOwnerAccess();
 
   if (
     !isConfigurationObject(request) ||
@@ -1633,7 +1488,7 @@ function importRetentionSettingsBackupFromAdmin(request) {
     const store = getRetentionSettingsBackupStore(true);
     saveRetentionSettingsBackupStore([importedBackup, ...store.backups]);
     return {
-      backups: getRetentionSettingsBackupsForAdmin(),
+      backups: getRetentionSettingsBackups(),
       importedBackupId: importedBackup.id,
       importedAt: importedBackup.importedAt,
     };
@@ -1648,8 +1503,8 @@ function importRetentionSettingsBackupFromAdmin(request) {
  * @param {Object} request Backup ID and explicit confirmation.
  * @return {Object} Refreshed backup list.
  */
-function deleteRetentionSettingsBackupFromAdmin(request) {
-  assertAdminOwnerAccess();
+function deleteRetentionSettingsBackup(request) {
+  assertInstallationOwnerAccess();
 
   if (
     !isConfigurationObject(request) ||
@@ -1678,92 +1533,12 @@ function deleteRetentionSettingsBackupFromAdmin(request) {
       store.backups.filter(backup => backup.id !== backupId),
     );
     return {
-      backups: getRetentionSettingsBackupsForAdmin(),
+      backups: getRetentionSettingsBackups(),
       deletedBackupId: backupId,
       deletedAt: new Date().toISOString(),
     };
   } finally {
     lock.releaseLock();
-  }
-}
-
-/**
- * Validates preferences that affect only the administration interface.
- * Keeping them separate prevents display choices from affecting retention jobs.
- *
- * @param {*} preferences Candidate admin preferences.
- * @return {{theme: string}} Validated preferences.
- */
-function validateRetentionAdminPreferences(preferences) {
-  if (!isConfigurationObject(preferences)) {
-    throw new Error('admin preferences must be an object.');
-  }
-
-  if (!['dark', 'light'].includes(preferences.theme)) {
-    throw new Error('admin theme must be dark or light.');
-  }
-
-  return { theme: preferences.theme };
-}
-
-/**
- * Persists private admin-interface preferences in Script Properties.
- *
- * @param {Object} preferences Candidate preferences.
- * @return {{theme: string}} Saved preferences.
- */
-function saveRetentionAdminPreferences(preferences) {
-  const validated = validateRetentionAdminPreferences(preferences);
-  const storedPreferences = {
-    schemaVersion: RETENTION_ADMIN_PREFERENCES_SCHEMA_VERSION,
-    preferences: validated,
-  };
-
-  PropertiesService.getScriptProperties().setProperty(
-    RETENTION_ADMIN_PREFERENCES_PROPERTY_KEY,
-    JSON.stringify(storedPreferences),
-  );
-
-  return { ...validated };
-}
-
-/**
- * Loads admin preferences and initializes or repairs the noncritical theme
- * preference with the dark factory default when necessary.
- *
- * @return {{theme: string}} Saved or default preferences.
- */
-function getRetentionAdminPreferences() {
-  const storedValue = PropertiesService.getScriptProperties().getProperty(
-    RETENTION_ADMIN_PREFERENCES_PROPERTY_KEY,
-  );
-
-  if (storedValue === null) {
-    return saveRetentionAdminPreferences(
-      RETENTION_ADMIN_FACTORY_PREFERENCES,
-    );
-  }
-
-  try {
-    const storedPreferences = JSON.parse(storedValue);
-
-    if (
-      !isConfigurationObject(storedPreferences) ||
-      storedPreferences.schemaVersion !==
-        RETENTION_ADMIN_PREFERENCES_SCHEMA_VERSION
-    ) {
-      throw new Error('unsupported or missing admin-preference schema');
-    }
-
-    return validateRetentionAdminPreferences(storedPreferences.preferences);
-  } catch (error) {
-    console.error(
-      `Resetting invalid ${RETENTION_ADMIN_PREFERENCES_PROPERTY_KEY}: ` +
-        `${error.message}`,
-    );
-    return saveRetentionAdminPreferences(
-      RETENTION_ADMIN_FACTORY_PREFERENCES,
-    );
   }
 }
 
@@ -2038,10 +1813,6 @@ function getRetentionContinuationState_() {
       Number.isNaN(new Date(parsed.scanStartedAt).getTime()) ||
       typeof parsed.runId !== 'string' ||
       !parsed.runId ||
-      (
-        parsed.triggerId !== null &&
-        (typeof parsed.triggerId !== 'string' || !parsed.triggerId)
-      ) ||
       !isValidRetentionContinuationTotals_(parsed.totals)
     ) {
       throw new Error('invalid continuation state');
@@ -2072,7 +1843,6 @@ function saveRetentionContinuationCheckpoint_(
       nextOffset,
       totalConversationCount,
       runId: current && current.runId ? current.runId : runId,
-      triggerId: current && current.triggerId ? current.triggerId : null,
       totals,
       scanStartedAt: current && current.scanStartedAt
         ? current.scanStartedAt
@@ -2123,75 +1893,11 @@ function addRetentionContinuationTotals_(totals, batch) {
   );
 }
 
-/** Removes a pending continuation trigger and its per-user cursor. */
+/** Removes the saved per-user scan checkpoint. */
 function clearRetentionContinuation_() {
-  const state = getRetentionContinuationState_();
-  if (state && state.triggerId) {
-    deleteProjectTriggerById_(state.triggerId);
-  }
   PropertiesService.getUserProperties().deleteProperty(
     RETENTION_CONTINUATION_PROPERTY_KEY,
   );
-}
-
-/** Saves the next offset and ensures exactly one follow-up batch is queued. */
-function scheduleRetentionContinuation_(nextOffset, totals, delayMs, runId) {
-  const current = getRetentionContinuationState_();
-  let triggerId = current && current.triggerId ? current.triggerId : null;
-  const triggerStillExists = triggerId && ScriptApp.getProjectTriggers().some(
-    trigger => trigger.getUniqueId() === triggerId,
-  );
-  if (!triggerStillExists) {
-    const trigger = ScriptApp.newTrigger(RETENTION_CONTINUATION_HANDLER)
-      .timeBased()
-      .after(delayMs || RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS)
-      .create();
-    triggerId = trigger.getUniqueId();
-  }
-  PropertiesService.getUserProperties().setProperty(
-    RETENTION_CONTINUATION_PROPERTY_KEY,
-    JSON.stringify({
-      schemaVersion: RETENTION_CONTINUATION_SCHEMA_VERSION,
-      nextOffset,
-      totalConversationCount: current
-        ? current.totalConversationCount
-        : nextOffset,
-      runId: current && current.runId ? current.runId : runId,
-      triggerId,
-      totals: totals || (current && current.totals) ||
-        createEmptyRetentionContinuationTotals_(),
-      scanStartedAt: current && current.scanStartedAt
-        ? current.scanStartedAt
-        : new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    }),
-  );
-}
-
-/** Runs a quota-spaced follow-up batch without changing the managed schedule. */
-function continueGmailRetention(event) {
-  const state = getRetentionContinuationState_();
-  const eventTriggerId = event && typeof event.triggerUid === 'string'
-    ? event.triggerUid
-    : '';
-  if (!state || !state.triggerId || state.triggerId !== eventTriggerId) {
-    return { status: 'skipped', reason: 'No matching continuation was pending.' };
-  }
-  // A one-time trigger has now been claimed. Preserve its cursor until the
-  // batch succeeds, but allow that batch to queue the next trigger.
-  deleteProjectTriggerById_(state.triggerId);
-  PropertiesService.getUserProperties().setProperty(
-    RETENTION_CONTINUATION_PROPERTY_KEY,
-    JSON.stringify({ ...state, triggerId: null }),
-  );
-  const result = enforceGmailRetention({
-    ...event,
-    retentionContinuation: true,
-  });
-  if (result && result.status === 'skipped') {
-    scheduleRetentionContinuation_(state.nextOffset, state.totals);
-  }
-  return result;
 }
 
 /** @return {Object} Empty operational state for a new installation. */
@@ -2318,13 +2024,12 @@ function getRuntimeErrorMessage(error) {
 }
 
 /**
- * Provides limited defense in depth in addition to the required owner-only web
- * app deployment. Some Apps Script execution contexts intentionally hide the
- * active user's email, so deployment access remains the authoritative control.
+ * Prevents an add-on execution from operating across two visible Google
+ * identities. Some Apps Script contexts intentionally hide the active email.
  *
  * @return {{ownerEmail: string, activeEmail: string}} Session identity details.
  */
-function assertAdminOwnerAccess() {
+function assertInstallationOwnerAccess() {
   const ownerEmail = Session.getEffectiveUser().getEmail() || '';
   const activeEmail = Session.getActiveUser().getEmail() || '';
 
@@ -2333,23 +2038,10 @@ function assertAdminOwnerAccess() {
     activeEmail &&
     ownerEmail.toLowerCase() !== activeEmail.toLowerCase()
   ) {
-    throw new Error('Access denied. This admin page is restricted to its owner.');
+    throw new Error('Access denied. This installation belongs to another account.');
   }
 
   return { ownerEmail, activeEmail };
-}
-
-/**
- * Serves the private administration interface.
- *
- * @return {HtmlOutput} Admin webpage.
- */
-function doGet() {
-  assertAdminOwnerAccess();
-
-  return HtmlService.createHtmlOutputFromFile('admin')
-    .setTitle(RETENTION_CONFIG.APPLICATION_NAME)
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
 /**
@@ -2819,8 +2511,8 @@ function saveRetentionFilterCleanupHistory_(items) {
     .forEach(key => properties.deleteProperty(key));
 }
 
-/** Returns public filter-cleanup data for the administration page. */
-function getRetentionFilterCleanupForAdmin_() {
+/** Returns filter-cleanup data for the Gmail settings card. */
+function getRetentionFilterCleanup_() {
   const history = getRetentionFilterCleanupHistory_();
   const latest = history[0] || null;
   let analysis;
@@ -2902,8 +2594,8 @@ function createAndVerifyRetentionFilter_(resource) {
 /**
  * Creates and verifies a replacement before removing the selected originals.
  */
-function mergeRetentionFiltersFromAdmin(request) {
-  assertAdminOwnerAccess();
+function mergeRetentionFilters(request) {
+  assertInstallationOwnerAccess();
   if (!isConfigurationObject(request) || typeof request.suggestionId !== 'string') {
     throw new Error('Select a valid filter-cleanup suggestion.');
   }
@@ -2981,7 +2673,7 @@ function mergeRetentionFiltersFromAdmin(request) {
         schemaVersion: RETENTION_FILTER_CLEANUP_HISTORY_SCHEMA_VERSION,
         ...receipt,
       },
-      filterCleanup: getRetentionFilterCleanupForAdmin_(),
+      filterCleanup: getRetentionFilterCleanup_(),
     };
   } finally {
     lock.releaseLock();
@@ -2989,8 +2681,8 @@ function mergeRetentionFiltersFromAdmin(request) {
 }
 
 /** Restores the most recently consolidated group and removes its replacement. */
-function undoLastRetentionFilterMergeFromAdmin() {
-  assertAdminOwnerAccess();
+function undoLastRetentionFilterMerge() {
+  assertInstallationOwnerAccess();
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
@@ -3036,86 +2728,11 @@ function undoLastRetentionFilterMergeFromAdmin() {
     return {
       message: `${receipt.originals.length} original filters were restored.`,
       restoredFilterIds: restoredIds,
-      filterCleanup: getRetentionFilterCleanupForAdmin_(),
+      filterCleanup: getRetentionFilterCleanup_(),
     };
   } finally {
     lock.releaseLock();
   }
-}
-
-/** Refreshes filter-cleanup suggestions without reloading the admin page. */
-function refreshRetentionFilterCleanupFromAdmin() {
-  assertAdminOwnerAccess();
-  return getRetentionFilterCleanupForAdmin_();
-}
-
-/**
- * Loads all data required to render or refresh the admin page.
- *
- * @return {Object} Serializable admin-page data.
- */
-function getAdminPageData() {
-  const identity = assertAdminOwnerAccess();
-  const trigger = getRetentionTriggerStatus();
-
-  return {
-    application: {
-      name: RETENTION_CONFIG.APPLICATION_NAME,
-      version: RETENTION_CONFIG.VERSION,
-      repositoryUrl: RETENTION_CONFIG.PROJECT_REPOSITORY_URL,
-      releasesUrl: `${RETENTION_CONFIG.PROJECT_REPOSITORY_URL}/releases`,
-      currentReleaseUrl: getProjectReleaseUrl(),
-      adminPageUrl: getAdminPageUrl(),
-      availableUpdate: null,
-      ownerEmail: identity.ownerEmail,
-      timeZone: trigger.preferences.timeZone,
-    },
-    configurationSchemaVersion: RETENTION_SETTINGS_SCHEMA_VERSION,
-    settings: copyRetentionSettings(getRetentionSettings()),
-    systemLabelColorOptions: [
-      ...GMAIL_LABEL_COLOR_PALETTE.map(option => ({
-        name: option.name,
-        backgroundColor: option.backgroundColor,
-        textColor: option.textColor,
-        selectable: true,
-      })),
-      ...GMAIL_LABEL_COLOR_COMPATIBILITY_PALETTE.map(option => ({
-        name: option.name,
-        backgroundColor: option.backgroundColor,
-        textColor: option.textColor,
-        selectable: false,
-      })),
-    ],
-    backups: getRetentionSettingsBackupsForAdmin(),
-    adminPreferences: getRetentionAdminPreferences(),
-    runtime: getRetentionRuntimeStateForClient_(),
-    trigger,
-    filterCleanup: null,
-  };
-}
-
-/** Returns update availability independently from the critical admin-page data. */
-function getAvailableUpdateForAdmin() {
-  assertAdminOwnerAccess();
-  return getAvailableUpdate();
-}
-
-/** Returns only the operational data needed for lightweight status refreshes. */
-function getAdminRuntimeData() {
-  assertAdminOwnerAccess();
-  return {
-    runtime: getRetentionRuntimeStateForClient_(),
-    trigger: getRetentionTriggerStatus(),
-  };
-}
-
-/** Adds a server-authoritative active flag for admin-page controls. */
-function getRetentionRuntimeStateForClient_() {
-  const runtime = getRetentionRuntimeState();
-  return {
-    ...runtime,
-    runPending: isRetentionRunPending_(runtime),
-  };
 }
 
 /**
@@ -3125,12 +2742,12 @@ function getRetentionRuntimeStateForClient_() {
  * @return {Card} Retention Manager sidebar card.
  */
 function buildGmailHomepage(event) {
-  assertAdminOwnerAccess();
+  assertInstallationOwnerAccess();
   const trigger = getRetentionTriggerStatus();
   const detectedTimeZone = !trigger.configured
     ? getAddOnEventTimeZone_(event)
     : null;
-  return buildRetentionSidebarCard_(detectedTimeZone
+  return buildRetentionHomeCard_(detectedTimeZone
     ? {
         preferences: {
           ...trigger.preferences,
@@ -3138,6 +2755,922 @@ function buildGmailHomepage(event) {
         },
       }
     : {});
+}
+
+/** Builds a compact, full-width native navigation row. */
+function createRetentionNavigationRow_(label, description, page, icon) {
+  return CardService.newDecoratedText()
+    .setText(`<b>${escapeHtml(label)}</b>  ›`)
+    .setBottomLabel(description)
+    .setWrapText(true)
+    .setStartIcon(CardService.newIconImage().setIcon(icon))
+    .setOnClickAction(
+      CardService.newAction()
+        .setFunctionName('openRetentionCardPage')
+        .setParameters({ page }),
+    );
+}
+
+/** Adds the standard Save button to a settings section. */
+function addRetentionSaveButton_(section, page) {
+  section.addWidget(
+    CardService.newTextButton()
+      .setText('Save Changes')
+      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName('saveRetentionCardPage')
+          .setParameters({ page })
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER),
+      ),
+  );
+  return section;
+}
+
+/** Adds a native switch. Native CardService controls cannot overflow the card. */
+function addRetentionSwitch_(section, fieldName, label, selected) {
+  section.addWidget(
+    CardService.newDecoratedText()
+      .setText(label)
+      .setWrapText(true)
+      .setSwitchControl(CardService.newSwitch()
+        .setFieldName(fieldName)
+        .setValue('true')
+        .setSelected(Boolean(selected))),
+  );
+  return section;
+}
+
+/** Builds a strong, icon-led title row shared by native settings pages. */
+function createRetentionPageTitleSection_(title, subtitle, icon) {
+  return CardService.newCardSection().addWidget(
+    CardService.newDecoratedText()
+      .setText(`<b>${escapeHtml(title)}</b>`)
+      .setBottomLabel(subtitle)
+      .setWrapText(true)
+      .setStartIcon(CardService.newIconImage().setIcon(icon)),
+  );
+}
+
+/** Declarative registry for every card page and Home navigation row. */
+const RETENTION_CARD_PAGES = Object.freeze({
+  rules: Object.freeze({
+    title: 'Retention Rules',
+    subtitle: 'Archive behavior and message protections',
+    icon: CardService.Icon.STAR,
+    builder: buildRetentionRulesCard_,
+  }),
+  schedule: Object.freeze({
+    title: 'Schedule', subtitle: 'Automatic runs and time zone',
+    icon: CardService.Icon.CLOCK, builder: buildRetentionScheduleCard_,
+  }),
+  notifications: Object.freeze({
+    title: 'Notifications', subtitle: 'Summary subject and retention',
+    icon: CardService.Icon.EMAIL, builder: buildRetentionNotificationsCard_,
+  }),
+  labels: Object.freeze({
+    title: 'Labels & Appearance', subtitle: 'Root, starter, and system labels',
+    icon: CardService.Icon.BOOKMARK, builder: buildRetentionLabelsCard_,
+  }),
+  system: Object.freeze({
+    title: 'System Settings', subtitle: 'Updates and diagnostic logging',
+    icon: CardService.Icon.DESCRIPTION, builder: buildRetentionSystemCard_,
+  }),
+  backups: Object.freeze({
+    title: 'Settings Backups', subtitle: 'Import, export, restore, or delete',
+    icon: CardService.Icon.TICKET, builder: buildRetentionBackupsCard_,
+  }),
+  filters: Object.freeze({
+    title: 'Filter Cleanup', subtitle: 'Analyze, merge, back up, and undo',
+    icon: CardService.Icon.OFFER, builder: buildRetentionFilterCleanupCard_,
+  }),
+  help: Object.freeze({
+    title: 'Help & Diagnostics', subtitle: 'Application status and resources',
+    icon: CardService.Icon.PERSON, builder: buildRetentionHelpCard_,
+  }),
+});
+
+/** Builds the 0.8 home page entirely inside the Gmail add-on card. */
+function buildRetentionHomeCard_(overrides = {}) {
+  const trigger = getRetentionTriggerStatus();
+  const runtime = getRetentionRuntimeState();
+  const runPending = isRetentionRunPending_(runtime);
+  const resumableScan = !runPending && Boolean(getRetentionContinuationState_());
+  const preferences = overrides.preferences || trigger.preferences;
+  const card = CardService.newCardBuilder().setHeader(
+    CardService.newCardHeader()
+      .setTitle(RETENTION_CONFIG.APPLICATION_NAME)
+      .setSubtitle('Label-based mailbox cleanup')
+      .setImageUrl(
+        'https://raw.githubusercontent.com/dynamiccookies/' +
+          'Retention-Manager-for-Gmail/main/icons/' +
+          'retention-manager-icon-128.png',
+      )
+      .setImageStyle(CardService.ImageStyle.SQUARE),
+  );
+
+  const scan = createSidebarSection_('Retention Scan');
+  scan.addWidget(
+    CardService.newDecoratedText()
+      .setTopLabel('Status')
+      .setText(formatSidebarStatus_(
+        runtime.lastRunStatus === 'never'
+          ? 'Ready'
+          : getSidebarStatusLabel_(runtime.lastRunStatus),
+        runtime.lastRunStatus === 'never' ? 'enabled' : runtime.lastRunStatus,
+      )),
+  );
+  if (runtime.lastRunStatus !== 'never' || runPending) {
+    if (runtime.lastRunStartedAt) {
+      scan.addWidget(CardService.newDecoratedText()
+        .setTopLabel('Started')
+        .setText(formatSidebarTimestamp_(
+          runtime.lastRunStartedAt,
+          preferences.timeZone,
+        )));
+    }
+    scan.addWidget(CardService.newTextParagraph().setText(
+      getSidebarResultSummary_(runtime.lastResult, preferences.timeZone),
+    ));
+  }
+  scan.addWidget(
+    CardService.newTextButton()
+      .setText(runPending
+        ? 'Scan in Progress'
+        : resumableScan
+          ? 'Continue Retention Scan'
+          : 'Run Retention Scan')
+      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+      .setDisabled(runPending)
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName('runRetentionFromSidebar')
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER),
+      ),
+  );
+  if (runPending) {
+    scan.addWidget(
+      CardService.newTextButton()
+        .setText('Refresh Progress')
+        .setOnClickAction(CardService.newAction()
+          .setFunctionName('refreshRetentionSidebarStatus')
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER)),
+    );
+  }
+  card.addSection(scan);
+
+  const overview = CardService.newCardSection();
+  overview.addWidget(CardService.newDecoratedText()
+    .setText(trigger.preferences.enabled
+      ? RETENTION_SCHEDULE_FREQUENCIES[trigger.preferences.frequency].label
+      : 'Disabled')
+    .setTopLabel('Schedule')
+    .setStartIcon(CardService.newIconImage().setIcon(CardService.Icon.CLOCK)));
+  overview.addWidget(CardService.newDecoratedText()
+    .setText(getSidebarNextRunText_(trigger, runtime))
+    .setTopLabel('Next Run')
+    .setWrapText(true));
+  overview.addWidget(CardService.newDecoratedText()
+    .setText(runtime.lastErrorMessage
+      ? formatSidebarStatus_('Attention needed', 'warning')
+      : formatSidebarStatus_('Resolved', 'success'))
+    .setTopLabel('Last Recorded Error'));
+  card.addSection(overview);
+
+  const settings = createSidebarSection_('Settings');
+  Object.entries(RETENTION_CARD_PAGES)
+    .filter(([page]) => page !== 'help')
+    .forEach(([page, definition]) => settings.addWidget(
+      createRetentionNavigationRow_(
+        definition.title,
+        definition.subtitle,
+        page,
+        definition.icon,
+      ),
+    ));
+  card.addSection(settings);
+  const footer = CardService.newCardSection();
+  footer.addWidget(createRetentionNavigationRow_(
+    'Help & Diagnostics',
+    `Version ${RETENTION_CONFIG.VERSION}`,
+    'help',
+    RETENTION_CARD_PAGES.help.icon,
+  ));
+  card.addSection(footer);
+  return card.build();
+}
+
+/** Resolves a card page name to its native builder. */
+function buildRetentionCardPage_(page) {
+  const definition = RETENTION_CARD_PAGES[page];
+  return definition ? definition.builder() : buildRetentionHomeCard_();
+}
+
+/** Returns the user-facing name for one configured Gmail label color. */
+function getRetentionLabelColorName_(backgroundColor) {
+  if (!backgroundColor) {
+    return 'Gmail default';
+  }
+  const option = [
+    ...GMAIL_LABEL_COLOR_PALETTE,
+    ...GMAIL_LABEL_COLOR_COMPATIBILITY_PALETTE,
+  ].find(candidate => candidate.backgroundColor === backgroundColor);
+  return option ? option.name : backgroundColor;
+}
+
+/** Pushes one native settings page over Home. */
+function openRetentionCardPage(event) {
+  assertInstallationOwnerAccess();
+  const page = getSidebarActionParameter_(event, 'page', 'home');
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().pushCard(
+      buildRetentionCardPage_(page),
+    ))
+    .build();
+}
+
+function buildRetentionRulesCard_() {
+  const settings = getRetentionSettings();
+  const behavior = createSidebarSection_('Expiration Behavior');
+  behavior.addWidget(CardService.newTextParagraph().setText(
+    '<font color="#5f6368"><i>Expired messages always move to Trash.</i></font>',
+  ));
+  const section = createSidebarSection_('Message Handling');
+  addRetentionSwitch_(
+    section,
+    'archiveOnLabel',
+    'Archive messages when a retention label is applied',
+    settings.ARCHIVE_ON_LABEL,
+  );
+  addRetentionSwitch_(
+    section,
+    'protectStarredMessages',
+    'Protect starred messages',
+    settings.PROTECT_STARRED_MESSAGES,
+  );
+  addRetentionSaveButton_(section, 'rules');
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Retention Rules',
+      'Expiration and protection behavior',
+      CardService.Icon.STAR,
+    ))
+    .addSection(behavior)
+    .addSection(section)
+    .build();
+}
+
+function buildRetentionScheduleCard_(overrides = {}) {
+  const trigger = getRetentionTriggerStatus();
+  const preferences = overrides.preferences || trigger.preferences;
+  const section = createSidebarSection_('Managed Schedule');
+  addRetentionSwitch_(section, 'scheduleEnabled', 'Enable automatic scans',
+    preferences.enabled);
+  const frequency = CardService.newSelectionInput()
+    .setFieldName('scheduleFrequency')
+    .setTitle('Frequency')
+    .setType(CardService.SelectionInputType.DROPDOWN)
+    .setOnChangeAction(CardService.newAction()
+      .setFunctionName('refreshRetentionCardSchedule'));
+  Object.entries(RETENTION_SCHEDULE_FREQUENCIES).forEach(([value, definition]) =>
+    frequency.addItem(definition.label, value, preferences.frequency === value));
+  section.addWidget(frequency);
+  if (preferences.frequency === 'daily') {
+    section.addWidget(CardService.newTextInput()
+      .setFieldName('scheduleDailyTime')
+      .setTitle('Daily Time (24-hour HH:MM)')
+      .setValue(preferences.dailyTime));
+  }
+  section.addWidget(CardService.newDecoratedText()
+    .setTopLabel('Time Zone')
+    .setText(preferences.timeZone));
+  if (trigger.needsRepair) {
+    section.addWidget(CardService.newTextParagraph().setText(
+      '<font color="#b06000">The managed schedule needs repair.</font>',
+    ));
+  }
+  addRetentionSaveButton_(section, 'schedule');
+  section.addWidget(CardService.newTextButton()
+    .setText('Repair Schedule')
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName('repairRetentionCardSchedule')
+      .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Schedule', 'Automatic retention scans', CardService.Icon.CLOCK,
+    ))
+    .addSection(section)
+    .build();
+}
+
+function buildRetentionNotificationsCard_() {
+  const settings = getRetentionSettings();
+  const section = createSidebarSection_('Deletion Summaries');
+  section.addWidget(CardService.newTextInput()
+    .setFieldName('notificationSubjectPrefix')
+    .setTitle('Email Subject Prefix')
+    .setValue(settings.NOTIFICATION_SUBJECT_PREFIX));
+  section.addWidget(CardService.newTextInput()
+    .setFieldName('notificationRetentionSuffix')
+    .setTitle('Summary Email Retention')
+    .setValue(settings.NOTIFICATION_RETENTION_LABEL_SUFFIX));
+  addRetentionSaveButton_(section, 'notifications');
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Notifications', 'Deletion summaries and retention', CardService.Icon.EMAIL,
+    ))
+    .addSection(section)
+    .build();
+}
+
+function buildRetentionLabelsCard_() {
+  const settings = getRetentionSettings();
+  const section = createSidebarSection_('Retention Labels');
+  section.addWidget(CardService.newTextInput()
+    .setFieldName('rootLabel').setTitle('Root Label').setValue(settings.ROOT_LABEL));
+  section.addWidget(CardService.newTextParagraph().setText(
+    'Example: <b>Retention/1m</b>',
+  ));
+  section.addWidget(CardService.newTextInput()
+    .setFieldName('starterLabels')
+    .setTitle('Starter Labels (comma separated)')
+    .setValue(settings.DEFAULT_RETENTION_LABEL_SUFFIXES.join(', ')));
+  section.addWidget(CardService.newTextParagraph().setText(
+    'Created only when the root label does not already exist.',
+  ));
+  section.addWidget(CardService.newTextInput()
+    .setFieldName('systemLabelSuffix')
+    .setTitle('System Notification Label')
+    .setValue(settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX));
+  const selectedColor = settings.SYSTEM_NOTIFICATION_LABEL_COLOR;
+  section.addWidget(CardService.newDecoratedText()
+    .setTopLabel('System Label Color')
+    .setText(selectedColor
+      ? `<font color="${selectedColor}">●</font> ` +
+        `<b>${escapeHtml(getRetentionLabelColorName_(selectedColor))}</b>`
+      : '<b>Gmail default</b>'));
+  section.addWidget(CardService.newTextButton()
+    .setText('Choose Label Color')
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName('openRetentionLabelColorPicker')));
+  addRetentionSaveButton_(section, 'labels');
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Labels & Appearance', 'Retention labels and Gmail colors',
+      CardService.Icon.BOOKMARK,
+    ))
+    .addSection(section)
+    .build();
+}
+
+/** Opens a visual palette using Gmail-supported label colors. */
+function openRetentionLabelColorPicker(event) {
+  const settings = getRetentionSettings();
+  const draft = {
+    rootLabel: getSidebarFormString_(event, 'rootLabel', settings.ROOT_LABEL),
+    starterLabels: getSidebarFormString_(event, 'starterLabels',
+      settings.DEFAULT_RETENTION_LABEL_SUFFIXES.join(', ')),
+    systemLabelSuffix: getSidebarFormString_(event, 'systemLabelSuffix',
+      settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX),
+  };
+  const draftPayload = JSON.stringify(draft);
+  const selectedColor = settings.SYSTEM_NOTIFICATION_LABEL_COLOR;
+  const section = createSidebarSection_('Gmail Label Colors');
+  const addColor = (name, backgroundColor, textColor) => {
+    const selected = backgroundColor === selectedColor;
+    section.addWidget(CardService.newDecoratedText()
+      .setText(
+        `${selected ? '<b>✓</b> ' : ''}` +
+          (backgroundColor
+            ? `<font color="${backgroundColor}">●</font> `
+            : '○ ') +
+          `<b>${escapeHtml(name)}</b>`,
+      )
+      .setBottomLabel(selected ? 'Currently selected' : 'Select this color')
+      .setOnClickAction(CardService.newAction()
+        .setFunctionName('selectRetentionCardLabelColor')
+        .setParameters({
+          backgroundColor,
+          draft: draftPayload,
+        })));
+  };
+  addColor('Gmail default', '', '');
+  GMAIL_LABEL_COLOR_PALETTE.forEach(option => addColor(
+    option.name,
+    option.backgroundColor,
+    option.textColor,
+  ));
+  return CardService.newActionResponseBuilder()
+    .setNavigation(CardService.newNavigation().pushCard(
+      CardService.newCardBuilder()
+        .setHeader(CardService.newCardHeader().setTitle('Choose Label Color'))
+        .addSection(section)
+        .build(),
+    ))
+    .build();
+}
+
+/** Saves one palette selection and returns to Labels & Appearance. */
+function selectRetentionCardLabelColor(event) {
+  try {
+    const backgroundColor = getSidebarActionParameter_(
+      event,
+      'backgroundColor',
+      '',
+    );
+    const currentSettings = getRetentionSettings();
+    const settings = copyRetentionSettings(currentSettings);
+    const draft = JSON.parse(getSidebarActionParameter_(event, 'draft', '{}'));
+    settings.ROOT_LABEL = typeof draft.rootLabel === 'string'
+      ? draft.rootLabel
+      : settings.ROOT_LABEL;
+    settings.DEFAULT_RETENTION_LABEL_SUFFIXES =
+      typeof draft.starterLabels === 'string'
+        ? draft.starterLabels.split(',').map(value => value.trim()).filter(Boolean)
+        : settings.DEFAULT_RETENTION_LABEL_SUFFIXES;
+    settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX =
+      typeof draft.systemLabelSuffix === 'string'
+        ? draft.systemLabelSuffix
+        : settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX;
+    settings.SYSTEM_NOTIFICATION_LABEL_COLOR = backgroundColor;
+    if (JSON.stringify(settings) === JSON.stringify(currentSettings)) {
+      return CardService.newActionResponseBuilder()
+        .setNavigation(CardService.newNavigation()
+          .popCard()
+          .updateCard(buildRetentionLabelsCard_()))
+        .setNotification(CardService.newNotification().setText(
+          'That label color is already selected.',
+        ))
+        .build();
+    }
+    saveRetentionCardSettings_({
+      settings,
+      acknowledgements: { systemLabelChange: true },
+    }, false);
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation()
+        .popCard()
+        .updateCard(buildRetentionLabelsCard_()))
+      .setNotification(CardService.newNotification().setText(
+        `Label settings saved with ${getRetentionLabelColorName_(backgroundColor)}.`,
+      ))
+      .build();
+  } catch (error) {
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText(
+        getRuntimeErrorMessage(error),
+      ))
+      .build();
+  }
+}
+
+function buildRetentionSystemCard_() {
+  const settings = getRetentionSettings();
+  const section = createSidebarSection_('Application');
+  addRetentionSwitch_(section, 'checkForUpdates', 'Check for updates',
+    settings.CHECK_FOR_UPDATES);
+  addRetentionSwitch_(section, 'verboseLogging', 'Verbose diagnostic logging',
+    settings.VERBOSE_LOGGING);
+  section.addWidget(CardService.newTextParagraph().setText(
+    '<font color="#b06000"><i>Verbose logs may contain message subjects and ' +
+      'label names. Turn this off after troubleshooting.</i></font>',
+  ));
+  addRetentionSaveButton_(section, 'system');
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'System Settings', 'Updates and diagnostics', CardService.Icon.DESCRIPTION,
+    ))
+    .addSection(section)
+    .build();
+}
+
+function buildRetentionBackupsCard_() {
+  const backups = getRetentionSettingsBackups();
+  const card = CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Settings Backups', 'Import, export, restore, or delete',
+      CardService.Icon.TICKET,
+    ));
+  const info = createSidebarSection_('Automatic Backups');
+  info.addWidget(CardService.newTextParagraph().setText(
+    `Up to ${backups.limit} backups are kept before settings changes.`,
+  ));
+  info.addWidget(CardService.newTextInput()
+    .setFieldName('backupJson')
+    .setTitle('Paste Backup JSON')
+    .setMultiline(true));
+  info.addWidget(CardService.newTextParagraph().setText(
+    '<font color="#5f6368"><i>Open an exported .json file in a text editor, ' +
+      'copy all of its contents, and paste them above.</i></font>',
+  ));
+  info.addWidget(CardService.newTextButton().setText('Import Backup')
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName('importRetentionCardBackup')
+      .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+  if (backups.warning) {
+    info.addWidget(CardService.newTextParagraph().setText(
+      `<font color="#b06000">${escapeHtml(backups.warning)}</font>`,
+    ));
+  }
+  card.addSection(info);
+  backups.items.forEach(backup => {
+    const section = CardService.newCardSection();
+    section.addWidget(CardService.newDecoratedText()
+      .setTopLabel(backup.reason.replace(/_/g, ' '))
+      .setText(formatSidebarTimestamp_(backup.importedAt || backup.createdAt,
+        getRetentionTriggerStatus().preferences.timeZone)));
+    section.addWidget(CardService.newTextButton()
+      .setText('Email Export')
+      .setOnClickAction(CardService.newAction()
+        .setFunctionName('exportRetentionCardBackup')
+        .setParameters({ backupId: backup.id })
+        .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+    section.addWidget(CardService.newButtonSet()
+      .addButton(CardService.newTextButton()
+        .setText('Restore')
+        .setOnClickAction(CardService.newAction()
+          .setFunctionName('manageRetentionCardBackup')
+          .setParameters({ backupId: backup.id, operation: 'restore' })
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER)))
+      .addButton(CardService.newTextButton()
+        .setText('Delete')
+        .setOnClickAction(CardService.newAction()
+          .setFunctionName('manageRetentionCardBackup')
+          .setParameters({ backupId: backup.id, operation: 'delete' })
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER))));
+    card.addSection(section);
+  });
+  if (backups.items.length === 0) {
+    info.addWidget(CardService.newTextParagraph().setText(
+      'No backups have been created yet.',
+    ));
+  }
+  return card.build();
+}
+
+function buildRetentionFilterCleanupCard_() {
+  const cleanup = getRetentionFilterCleanup_();
+  const card = CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Filter Cleanup', 'Analyze and safely merge filters', CardService.Icon.OFFER,
+    ));
+  const summary = createSidebarSection_('Analysis');
+  summary.addWidget(CardService.newTextParagraph().setText(
+    `${cleanup.totalFilterCount} Gmail filter(s) reviewed. ` +
+      `${cleanup.suggestions.length} safe merge suggestion(s).`,
+  ));
+  summary.addWidget(CardService.newTextButton().setText('Refresh Analysis')
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName('refreshRetentionCardFilters')
+      .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+  if (cleanup.undo.available) {
+    summary.addWidget(CardService.newTextButton().setText('Undo Last Merge')
+      .setOnClickAction(CardService.newAction()
+        .setFunctionName('undoRetentionCardFilterMerge')
+        .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+  }
+  card.addSection(summary);
+  cleanup.suggestions.forEach(suggestion => {
+    const section = CardService.newCardSection();
+    section.addWidget(CardService.newDecoratedText()
+      .setTopLabel(suggestion.labelName)
+      .setText(`${suggestion.originalCount} filters → ` +
+        `${suggestion.replacementCount} filter`));
+    section.addWidget(CardService.newTextParagraph().setText(
+      escapeHtml(suggestion.combinedQuery),
+    ));
+    section.addWidget(CardService.newTextButton().setText('Merge Filters')
+      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+      .setOnClickAction(CardService.newAction()
+        .setFunctionName('mergeRetentionCardFilters')
+        .setParameters({ suggestionId: suggestion.id })
+        .setLoadIndicator(CardService.LoadIndicator.SPINNER)));
+    card.addSection(section);
+  });
+  return card.build();
+}
+
+function buildRetentionHelpCard_() {
+  const trigger = getRetentionTriggerStatus();
+  const runtime = getRetentionRuntimeState();
+  const section = createSidebarSection_('Diagnostics');
+  section.addWidget(CardService.newDecoratedText().setTopLabel('Version')
+    .setText(RETENTION_CONFIG.VERSION));
+  section.addWidget(CardService.newDecoratedText().setTopLabel('Schedule')
+    .setText(trigger.status));
+  section.addWidget(CardService.newDecoratedText().setTopLabel('Last Run')
+    .setText(runtime.lastRunStatus));
+  section.addWidget(CardService.newTextButton().setText('Documentation')
+    .setOpenLink(CardService.newOpenLink()
+      .setUrl(RETENTION_CONFIG.PROJECT_REPOSITORY_URL)
+      .setOpenAs(CardService.OpenAs.FULL_SIZE)));
+  section.addWidget(CardService.newTextButton().setText('Release Notes')
+    .setOpenLink(CardService.newOpenLink()
+      .setUrl(getProjectReleaseUrl())
+      .setOpenAs(CardService.OpenAs.FULL_SIZE)));
+  return CardService.newCardBuilder()
+    .addSection(createRetentionPageTitleSection_(
+      'Help & Diagnostics', 'Application status and resources',
+      CardService.Icon.PERSON,
+    ))
+    .addSection(section)
+    .build();
+}
+
+/** Returns whether a native card switch was submitted as selected. */
+function getRetentionCardSwitch_(event, fieldName) {
+  return getSidebarFormString_(event, fieldName, '') === 'true';
+}
+
+/** Updates the currently open native settings page. */
+function buildRetentionPageResponse_(page, message) {
+  const builder = CardService.newActionResponseBuilder().setNavigation(
+    CardService.newNavigation().updateCard(buildRetentionCardPage_(page)),
+  );
+  if (message) {
+    builder.setNotification(CardService.newNotification().setText(message));
+  }
+  return builder.build();
+}
+
+/** Runs a card mutation with consistent refresh and user-visible errors. */
+function runRetentionCardOperation_(page, successMessage, operation) {
+  try {
+    const result = operation();
+    const message = typeof successMessage === 'function'
+      ? successMessage(result)
+      : successMessage;
+    return buildRetentionPageResponse_(page, message);
+  } catch (error) {
+    return buildRetentionPageResponse_(page, getRuntimeErrorMessage(error));
+  }
+}
+
+/** Page-owned setting mutations; fields on other pages remain untouched. */
+const RETENTION_CARD_SETTINGS_APPLIERS = Object.freeze({
+  rules: (settings, event) => {
+    settings.ARCHIVE_ON_LABEL = getRetentionCardSwitch_(event, 'archiveOnLabel');
+    settings.PROTECT_STARRED_MESSAGES = getRetentionCardSwitch_(
+      event,
+      'protectStarredMessages',
+    );
+  },
+  notifications: (settings, event) => {
+    settings.NOTIFICATION_SUBJECT_PREFIX = getSidebarFormString_(
+      event, 'notificationSubjectPrefix', settings.NOTIFICATION_SUBJECT_PREFIX,
+    );
+    settings.NOTIFICATION_RETENTION_LABEL_SUFFIX = getSidebarFormString_(
+      event,
+      'notificationRetentionSuffix',
+      settings.NOTIFICATION_RETENTION_LABEL_SUFFIX,
+    );
+  },
+  labels: (settings, event) => {
+    settings.ROOT_LABEL = getSidebarFormString_(
+      event, 'rootLabel', settings.ROOT_LABEL,
+    );
+    settings.DEFAULT_RETENTION_LABEL_SUFFIXES = getSidebarFormString_(
+      event,
+      'starterLabels',
+      settings.DEFAULT_RETENTION_LABEL_SUFFIXES.join(', '),
+    ).split(',').map(value => value.trim()).filter(Boolean);
+    settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX = getSidebarFormString_(
+      event, 'systemLabelSuffix', settings.SYSTEM_NOTIFICATION_LABEL_SUFFIX,
+    );
+  },
+  system: (settings, event) => {
+    settings.CHECK_FOR_UPDATES = getRetentionCardSwitch_(event, 'checkForUpdates');
+    settings.VERBOSE_LOGGING = getRetentionCardSwitch_(event, 'verboseLogging');
+  },
+});
+
+/** Saves one card page without overwriting fields owned by other pages. */
+function saveRetentionCardPage(event) {
+  assertInstallationOwnerAccess();
+  const page = getSidebarActionParameter_(event, 'page', '');
+  try {
+    if (page === 'schedule') {
+      const trigger = getRetentionTriggerStatus();
+      saveRetentionSchedule({
+        preferences: validateRetentionSchedulePreferences({
+          ...trigger.preferences,
+          enabled: getRetentionCardSwitch_(event, 'scheduleEnabled'),
+          frequency: getSidebarFormString_(event, 'scheduleFrequency',
+            trigger.preferences.frequency),
+          dailyTime: getSidebarFormString_(event, 'scheduleDailyTime',
+            trigger.preferences.dailyTime),
+        }),
+        confirmExistingTriggers: true,
+      });
+      return buildRetentionPageResponse_(page, 'Schedule saved.');
+    }
+
+    const settings = copyRetentionSettings(getRetentionSettings());
+    const applyPageSettings = RETENTION_CARD_SETTINGS_APPLIERS[page];
+    if (!applyPageSettings) {
+      throw new Error('That settings page is not available.');
+    }
+    applyPageSettings(settings, event);
+
+    if (JSON.stringify(settings) === JSON.stringify(getRetentionSettings())) {
+      return buildRetentionPageResponse_(page, 'No changes to save.');
+    }
+
+    saveRetentionCardSettings_({
+      settings,
+      acknowledgements: { systemLabelChange: true },
+    }, false);
+    return buildRetentionPageResponse_(page, 'Changes saved.');
+  } catch (error) {
+    return buildRetentionPageResponse_(page,
+      getRuntimeErrorMessage(error));
+  }
+}
+
+/** Rerenders the schedule page when its frequency changes. */
+function refreshRetentionCardSchedule(event) {
+  const trigger = getRetentionTriggerStatus();
+  return CardService.newActionResponseBuilder().setNavigation(
+    CardService.newNavigation().updateCard(buildRetentionScheduleCard_({
+      preferences: {
+        ...trigger.preferences,
+        enabled: getRetentionCardSwitch_(event, 'scheduleEnabled'),
+        frequency: getSidebarFormString_(event, 'scheduleFrequency',
+          trigger.preferences.frequency),
+        dailyTime: getSidebarFormString_(event, 'scheduleDailyTime',
+          trigger.preferences.dailyTime),
+      },
+    })),
+  ).build();
+}
+
+/** Repairs the managed trigger using the currently saved schedule. */
+function repairRetentionCardSchedule() {
+  return runRetentionCardOperation_('schedule', 'Schedule repaired.', () => {
+    const trigger = getRetentionTriggerStatus();
+    return repairRetentionSchedule({
+      preferences: trigger.preferences,
+      confirmExistingTriggers: true,
+    });
+  });
+}
+
+/** Builds a detailed confirmation card for a destructive backup operation. */
+function buildRetentionBackupConfirmationCard_(backup, operation) {
+  const restoring = operation === 'restore';
+  const timeZone = getRetentionTriggerStatus().preferences.timeZone;
+  return CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle(
+      restoring ? 'Restore Backup?' : 'Delete Backup?',
+    ))
+    .addSection(CardService.newCardSection()
+      .addWidget(CardService.newTextParagraph().setText(restoring
+        ? 'Current settings will be backed up before the selected copy is restored.'
+        : 'This retained settings backup will be permanently removed.'))
+      .addWidget(CardService.newDecoratedText()
+        .setTopLabel(restoring ? 'Selected Backup' : 'Backup to Delete')
+        .setText(formatSidebarTimestamp_(
+          backup.importedAt || backup.createdAt,
+          timeZone,
+        ))
+        .setBottomLabel(
+          `${backup.reason.replace(/_/g, ' ')} · App ${backup.applicationVersion}`,
+        ))
+      .addWidget(CardService.newDecoratedText()
+        .setTopLabel('Root Label')
+        .setText(backup.configuration.settings.ROOT_LABEL))
+      .addWidget(CardService.newTextButton()
+        .setText(restoring ? 'Restore Settings' : 'Delete Backup')
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(CardService.newAction()
+          .setFunctionName('manageRetentionCardBackup')
+          .setParameters({
+            backupId: backup.id,
+            operation,
+            confirmed: 'true',
+          })
+          .setLoadIndicator(CardService.LoadIndicator.SPINNER))))
+    .build();
+}
+
+/** Confirms and performs restore/delete through one backup action endpoint. */
+function manageRetentionCardBackup(event) {
+  const backupId = getSidebarActionParameter_(event, 'backupId', '');
+  const operation = getSidebarActionParameter_(event, 'operation', '');
+  if (!['restore', 'delete'].includes(operation)) {
+    return buildRetentionPageResponse_('backups', 'Unknown backup operation.');
+  }
+  const confirmed = getSidebarActionParameter_(event, 'confirmed', 'false') ===
+    'true';
+  if (!confirmed) {
+    try {
+      const backup = getRetentionSettingsBackupById(backupId);
+      return CardService.newActionResponseBuilder()
+        .setNavigation(CardService.newNavigation().pushCard(
+          buildRetentionBackupConfirmationCard_(backup, operation),
+        )).build();
+    } catch (error) {
+      return buildRetentionPageResponse_('backups', getRuntimeErrorMessage(error));
+    }
+  }
+  try {
+    if (operation === 'restore') {
+      restoreRetentionSettingsBackup({
+        backupId,
+        confirmRestore: true,
+        acknowledgements: { systemLabelChange: true },
+      });
+    } else {
+      deleteRetentionSettingsBackup({ backupId, confirmDelete: true });
+    }
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().popCard().updateCard(
+        buildRetentionBackupsCard_(),
+      ))
+      .setNotification(CardService.newNotification().setText(
+        operation === 'restore' ? 'Settings restored.' : 'Backup deleted.',
+      )).build();
+  } catch (error) {
+    return buildRetentionPageResponse_('backups',
+      getRuntimeErrorMessage(error));
+  }
+}
+
+/** Imports a backup pasted into the card, avoiding a separate web interface. */
+function importRetentionCardBackup(event) {
+  return runRetentionCardOperation_('backups', 'Backup imported.', () =>
+    importRetentionSettingsBackup({
+      content: getSidebarFormString_(event, 'backupJson', ''),
+    }),
+  );
+}
+
+/** Emails a portable JSON export because native cards cannot download files. */
+function exportRetentionCardBackup(event) {
+  try {
+    const backup = getRetentionSettingsBackupById(
+      getSidebarActionParameter_(event, 'backupId', ''),
+    );
+    const exported = JSON.stringify({
+      fileType: RETENTION_SETTINGS_BACKUP_EXPORT_TYPE,
+      exportSchemaVersion: RETENTION_SETTINGS_BACKUP_EXPORT_SCHEMA_VERSION,
+      exportedAt: new Date().toISOString(),
+      backup,
+    }, null, 2);
+    const recipient = Session.getEffectiveUser().getEmail();
+    const timeZone = getRetentionTriggerStatus().preferences.timeZone;
+    const backupTimestamp = formatSidebarTimestamp_(
+      backup.importedAt || backup.createdAt,
+      timeZone,
+    );
+    const reason = backup.reason.replace(/_/g, ' ');
+    GmailApp.sendEmail(
+      recipient,
+      `${RETENTION_CONFIG.APPLICATION_NAME} settings backup — ${backupTimestamp}`,
+      [
+        'Your portable settings backup is attached.',
+        '',
+        `Backup date: ${backupTimestamp}`,
+        `Change type: ${reason}`,
+        `Application version: ${backup.applicationVersion}`,
+        `Settings schema: ${backup.configurationSchemaVersion}`,
+        `Root label: ${backup.configuration.settings.ROOT_LABEL}`,
+        `Exported: ${formatSidebarTimestamp_(new Date(), timeZone)}`,
+      ].join('\n'),
+      {
+        attachments: [Utilities.newBlob(
+          exported,
+          'application/json',
+          `retention-manager-settings-${backup.id}.json`,
+        )],
+      },
+    );
+    return buildRetentionPageResponse_('backups',
+      `Backup emailed to ${recipient}.`);
+  } catch (error) {
+    return buildRetentionPageResponse_('backups',
+      getRuntimeErrorMessage(error));
+  }
+}
+
+function refreshRetentionCardFilters() {
+  return buildRetentionPageResponse_('filters', 'Analysis refreshed.');
+}
+
+function mergeRetentionCardFilters(event) {
+  return runRetentionCardOperation_('filters', result => result.message, () =>
+    mergeRetentionFilters({
+      suggestionId: getSidebarActionParameter_(event, 'suggestionId', ''),
+    }),
+  );
+}
+
+function undoRetentionCardFilterMerge() {
+  return runRetentionCardOperation_(
+    'filters',
+    result => result.message,
+    () => undoLastRetentionFilterMerge(),
+  );
 }
 
 /**
@@ -3351,14 +3884,19 @@ function getSidebarResultSummary_(result, timeZone) {
       'MMM d, h:mm a z',
     ))}`
     : '';
-  const resumeTime = result.status === 'paused' &&
-      result.nextContinuationAt && timeZone
-    ? `<br>Resuming around ${escapeHtml(Utilities.formatDate(
-      new Date(result.nextContinuationAt),
-      timeZone,
-      'h:mm:ss a z',
-    ))}`
-    : '';
+  let resumeTime = '';
+  if (result.status === 'paused' && result.nextContinuationAt) {
+    const remainingSeconds = Math.max(
+      1,
+      Math.ceil((new Date(result.nextContinuationAt).getTime() - Date.now()) /
+        1000),
+    );
+    const roundedSeconds = Math.max(5, Math.ceil(remainingSeconds / 5) * 5);
+    resumeTime = '<br><font color="#b06000"><b>Temporary Gmail quota ' +
+      'pause</b></font><br>' +
+      `Resumes automatically in approximately ${roundedSeconds} seconds. ` +
+      'No action is required.';
+  }
   return `${progress}<br>` +
     `${moved} message${moved === 1 ? '' : 's'} moved` +
     (duration ? `<br>Run time: ${duration}` : '') +
@@ -3523,520 +4061,15 @@ function getSidebarNextRunText_(trigger, runtime) {
     definition.label;
 }
 
-/**
- * Builds the operational Gmail sidebar.
- *
- * @param {Object=} overrides Unsaved form values used during card refresh.
- * @return {Card} Sidebar card.
- */
-function buildRetentionSidebarCard_(overrides = {}) {
-  const settings = getRetentionSettings();
-  const trigger = getRetentionTriggerStatus();
-  const runtime = getRetentionRuntimeState();
-  const runPending = isRetentionRunPending_(runtime);
-  const preferences = overrides.preferences || trigger.preferences;
-  const rootLabel = Object.prototype.hasOwnProperty.call(overrides, 'rootLabel')
-    ? overrides.rootLabel
-    : settings.ROOT_LABEL;
-  const card = CardService.newCardBuilder()
-    .setHeader(
-      CardService.newCardHeader().setTitle(RETENTION_CONFIG.APPLICATION_NAME),
-    );
-
-  const statusSection = createSidebarSection_('Status');
-  const scheduleStatus = trigger.status === 'enabled'
-    ? 'Active'
-    : trigger.status === 'warning'
-      ? 'Attention needed'
-      : 'Disabled';
-  const scheduleStatusType = trigger.status === 'enabled'
-    ? 'success'
-    : trigger.status === 'warning'
-      ? 'warning'
-      : 'disabled';
-  statusSection.addWidget(
-    CardService.newDecoratedText()
-      .setTopLabel('Schedule')
-      .setText(formatSidebarStatus_(scheduleStatus, scheduleStatusType)),
-  );
-  statusSection.addWidget(
-    CardService.newDecoratedText()
-      .setTopLabel(runtime.lastRunStatus === 'queued' && runPending
-        ? 'Requested'
-        : 'Last Run')
-      .setText(formatSidebarTimestamp_(
-        runtime.lastRunStatus === 'queued' && runPending
-          ? runtime.lastRunQueuedAt
-          : runtime.lastRunCompletedAt || runtime.lastRunStartedAt,
-        preferences.timeZone,
-      )),
-  );
-  statusSection.addWidget(
-    CardService.newDecoratedText()
-      .setTopLabel('Result')
-      .setText(runtime.lastRunStatus === 'never'
-        ? formatSidebarStatus_('Never run', 'never')
-        : formatSidebarStatus_(
-          getSidebarStatusLabel_(runtime.lastRunStatus),
-          runtime.lastRunStatus,
-        )),
-  );
-  if (
-    runPending &&
-    ['paused', 'continuing'].includes(runtime.lastRunStatus)
-  ) {
-    statusSection.addWidget(
-      CardService.newTextParagraph().setText(
-        getSidebarResultSummary_(runtime.lastResult, preferences.timeZone),
-      ),
-    );
-  } else if (runPending) {
-    const pendingAt = runtime.lastRunStatus === 'queued'
-      ? runtime.lastRunQueuedAt
-      : runtime.lastRunStartedAt;
-    const pendingDuration = formatSidebarRunDuration_(pendingAt, null);
-    const pendingTime = pendingAt
-      ? Utilities.formatDate(
-        new Date(pendingAt),
-        preferences.timeZone,
-        'h:mm:ss a z',
-      )
-      : 'an unknown time';
-    statusSection.addWidget(
-      CardService.newTextParagraph().setText(
-        runtime.lastRunStatus === 'queued'
-          ? `Queued at ${escapeHtml(pendingTime)}` +
-            (pendingDuration
-              ? ` · waiting ${escapeHtml(pendingDuration)} to start.`
-              : ' · waiting to start.')
-          : `Started at ${escapeHtml(pendingTime)}` +
-            (pendingDuration
-              ? ` · running for ${escapeHtml(pendingDuration)}.`
-              : ' · scan in progress.'),
-      ),
-    );
-    if (
-      runtime.lastRunStatus === 'running' &&
-      runtime.lastResult && runtime.lastResult.scanComplete === false
-    ) {
-      statusSection.addWidget(
-        CardService.newTextParagraph().setText(
-          getSidebarResultSummary_(runtime.lastResult, preferences.timeZone),
-        ),
-      );
-    }
-  } else if (runtime.lastRunStatus !== 'never') {
-    statusSection.addWidget(
-      CardService.newTextParagraph().setText(
-        getSidebarResultSummary_(runtime.lastResult, preferences.timeZone),
-      ),
-    );
-  }
-  if (
-    ['error', 'warning'].includes(runtime.lastRunStatus) &&
-    runtime.lastErrorMessage
-  ) {
-    const errorColor = runtime.lastRunStatus === 'error'
-      ? '#c5221f'
-      : '#b06000';
-    statusSection.addWidget(
-      CardService.newTextParagraph().setText(
-        `<font color="${errorColor}">` +
-          `${escapeHtml(runtime.lastErrorMessage)}</font>`,
-      ),
-    );
-  }
-  card.addSection(statusSection);
-
-  const nextRunSection = createSidebarSection_('Next Run');
-  nextRunSection.addWidget(
-    CardService.newTextParagraph().setText(
-      getSidebarNextRunText_(trigger, runtime),
-    ),
-  );
-  card.addSection(nextRunSection);
-
-  const frequencyChangeAction = CardService.newAction()
-    .setFunctionName('refreshRetentionSidebarSchedule');
-  const scheduleSection = createSidebarSection_('Schedule');
-  scheduleSection.addWidget(
-    CardService.newSelectionInput()
-      .setFieldName('scheduleEnabled')
-      .setType(CardService.SelectionInputType.SWITCH)
-      .addItem('Enabled', 'true', preferences.enabled),
-  );
-  const frequencyInput = CardService.newSelectionInput()
-    .setTitle('Frequency')
-    .setFieldName('scheduleFrequency')
-    .setType(CardService.SelectionInputType.DROPDOWN)
-    .setOnChangeAction(frequencyChangeAction);
-  Object.entries(RETENTION_SCHEDULE_FREQUENCIES).forEach(([value, definition]) => {
-    frequencyInput.addItem(
-      definition.label,
-      value,
-      preferences.frequency === value,
-    );
-  });
-  scheduleSection.addWidget(frequencyInput);
-  if (preferences.frequency === 'daily') {
-    scheduleSection.addWidget(
-      CardService.newTextInput()
-        .setFieldName('scheduleDailyTime')
-        .setTitle('Daily Time (24-hour HH:MM)')
-        .setValue(preferences.dailyTime),
-    );
-  }
-  scheduleSection.addWidget(
-    CardService.newDecoratedText()
-      .setTopLabel('Time Zone')
-      .setText(preferences.timeZone),
-  );
-  card.addSection(scheduleSection);
-
-  const rootLabelSection = CardService.newCardSection();
-  rootLabelSection.addWidget(
-    CardService.newTextInput()
-      .setFieldName('rootRetentionLabel')
-      .setTitle('Root Retention Label')
-      .setValue(rootLabel),
-  );
-  rootLabelSection.addWidget(
-    CardService.newTextButton()
-      .setText('Save Settings')
-      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-      .setOnClickAction(
-        CardService.newAction()
-          .setFunctionName('saveRetentionSidebarSettings'),
-      ),
-  );
-  card.addSection(rootLabelSection);
-
-  const actionsSection = createSidebarSection_('Actions');
-  const runAction = CardService.newAction()
-    .setFunctionName('runRetentionFromSidebar')
-    .setLoadIndicator(CardService.LoadIndicator.SPINNER);
-  actionsSection.addWidget(
-    CardService.newTextButton()
-      .setText(runtime.lastRunStatus === 'queued' && runPending
-        ? 'Run Queued'
-        : runtime.lastRunStatus === 'running' && runPending
-          ? 'Running…'
-          : 'Run Now')
-      .setDisabled(runPending)
-      .setOnClickAction(runAction),
-  );
-  if (runPending) {
-    actionsSection.addWidget(
-      CardService.newTextButton()
-        .setText('Refresh Status')
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('refreshRetentionSidebarStatus')
-            .setLoadIndicator(CardService.LoadIndicator.SPINNER),
-        ),
-    );
-  }
-  const adminPageUrl = getAdminPageUrl();
-  if (adminPageUrl) {
-    actionsSection.addWidget(
-      CardService.newTextButton()
-        .setText('Advanced Settings')
-        .setOpenLink(
-          CardService.newOpenLink()
-            .setUrl(adminPageUrl)
-            .setOpenAs(CardService.OpenAs.FULL_SIZE)
-            .setOnClose(CardService.OnClose.NOTHING),
-        ),
-    );
-  } else {
-    actionsSection.addWidget(
-      CardService.newTextParagraph().setText(
-        'Paste the Web app URL shown when you deployed this project. ' +
-          'The URL must end in <b>/exec</b>.',
-      ),
-    );
-    actionsSection.addWidget(
-      CardService.newTextInput()
-        .setFieldName('adminPageUrl')
-        .setTitle('Web App URL')
-        .setValue(typeof overrides.adminPageUrl === 'string'
-          ? overrides.adminPageUrl
-          : ''),
-    );
-    actionsSection.addWidget(
-      CardService.newTextButton()
-        .setText('Save Web App URL')
-        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-        .setOnClickAction(
-          CardService.newAction()
-            .setFunctionName('saveRetentionAdminPageUrl')
-            .setLoadIndicator(CardService.LoadIndicator.SPINNER),
-        ),
-    );
-  }
-  card.addSection(actionsSection);
-
-  card.addSection(
-    CardService.newCardSection().addWidget(
-      CardService.newTextParagraph().setText(
-        `<a href="${getProjectReleaseUrl()}">` +
-          `Version ${RETENTION_CONFIG.VERSION}</a>`,
-      ),
-    ),
-  );
-  return card.build();
-}
-
-/**
- * Rerenders schedule-dependent fields without saving the form.
- *
- * @param {Object} event Add-on form event.
- * @return {ActionResponse} Updated sidebar.
- */
-function refreshRetentionSidebarSchedule(event) {
-  const trigger = getRetentionTriggerStatus();
-  const detectedTimeZone = !trigger.configured
-    ? getAddOnEventTimeZone_(event)
-    : null;
-  const frequency = getSidebarFormString_(
-    event,
-    'scheduleFrequency',
-    trigger.preferences.frequency,
-  );
-  const preferences = {
-    ...trigger.preferences,
-    timeZone: detectedTimeZone || trigger.preferences.timeZone,
-    enabled: getSidebarFormString_(event, 'scheduleEnabled', '') === 'true',
-    frequency,
-    dailyTime: getSidebarFormString_(
-      event,
-      'scheduleDailyTime',
-      trigger.preferences.dailyTime,
-    ),
-  };
-  const rootLabel = getSidebarFormString_(
-    event,
-    'rootRetentionLabel',
-    getRetentionSettings().ROOT_LABEL,
-  );
-  return CardService.newActionResponseBuilder()
-    .setNavigation(
-      CardService.newNavigation().updateCard(
-        buildRetentionSidebarCard_({ preferences, rootLabel }),
-      ),
-    )
-    .build();
-}
-
-/**
- * Converts the current sidebar fields into validated settings and schedule data.
- *
- * @param {Object} event Add-on form event.
- * @return {Object} Validated sidebar request.
- */
-function getRetentionSidebarRequest_(event) {
-  const settings = copyRetentionSettings(getRetentionSettings());
-  const trigger = getRetentionTriggerStatus();
-  settings.ROOT_LABEL = getSidebarFormString_(
-    event,
-    'rootRetentionLabel',
-    settings.ROOT_LABEL,
-  );
-  const preferences = {
-    ...trigger.preferences,
-    timeZone: !trigger.configured
-      ? getAddOnEventTimeZone_(event) || trigger.preferences.timeZone
-      : trigger.preferences.timeZone,
-    enabled: getSidebarFormString_(event, 'scheduleEnabled', '') === 'true',
-    frequency: getSidebarFormString_(
-      event,
-      'scheduleFrequency',
-      trigger.preferences.frequency,
-    ),
-    dailyTime: getSidebarFormString_(
-      event,
-      'scheduleDailyTime',
-      trigger.preferences.dailyTime,
-    ),
-  };
-  return {
-    settings: validateRetentionSettings(settings),
-    preferences: validateRetentionSchedulePreferences(preferences),
-  };
-}
-
 /** @return {ActionResponse} Sidebar card plus optional notification. */
 function buildSidebarActionResponse_(message) {
   const builder = CardService.newActionResponseBuilder().setNavigation(
-    CardService.newNavigation().updateCard(buildRetentionSidebarCard_()),
+    CardService.newNavigation().updateCard(buildRetentionHomeCard_()),
   );
   if (message) {
     builder.setNotification(CardService.newNotification().setText(message));
   }
   return builder.build();
-}
-
-/** Saves sidebar settings and schedule under one lock, restoring the schedule on failure. */
-function applyRetentionSidebarSettings_(request, confirmExistingTriggers) {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(RETENTION_CONFIG.LOCK_TIMEOUT_MS)) {
-    throw new Error(
-      'Another retention operation is active. Wait for it to finish and try again.',
-    );
-  }
-
-  const priorSchedule = getRetentionScheduleConfiguration();
-  const priorTriggerStatus = getRetentionTriggerStatus();
-  const settingsChanged = !retentionSettingsEqual(
-    getRetentionSettings(),
-    request.settings,
-  );
-  const scheduleChanged = priorTriggerStatus.needsRepair ||
-    !priorSchedule.configured ||
-    !retentionSchedulePreferencesEqual(
-      priorSchedule.preferences,
-      request.preferences,
-    );
-  try {
-    if (scheduleChanged) {
-      applyRetentionScheduleFromAdmin(
-        {
-          preferences: request.preferences,
-          confirmExistingTriggers,
-        },
-        false,
-        true,
-      );
-    }
-    return settingsChanged
-      ? saveAdminPageSettings_(
-          { settings: request.settings, acknowledgements: {} },
-          true,
-        )
-      : { settings: copyRetentionSettings(getRetentionSettings()) };
-  } catch (error) {
-    if (scheduleChanged) {
-      try {
-        applyRetentionScheduleFromAdmin(
-          {
-            preferences: priorSchedule.preferences,
-            confirmExistingTriggers: true,
-          },
-          false,
-          true,
-        );
-      } catch (rollbackError) {
-        throw new Error(
-          `${getRuntimeErrorMessage(error)} Schedule rollback also failed: ` +
-            getRuntimeErrorMessage(rollbackError),
-        );
-      }
-    }
-    throw error;
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/**
- * Saves the card's root label and managed schedule.
- *
- * @param {Object} event Add-on form event.
- * @return {ActionResponse} Refreshed sidebar.
- */
-function saveRetentionSidebarSettings(event) {
-  assertAdminOwnerAccess();
-  try {
-    const request = getRetentionSidebarRequest_(event);
-    const trigger = getRetentionTriggerStatus();
-    const confirmed = getSidebarActionParameter_(
-      event,
-      'confirmExistingTriggers',
-      'false',
-    ) === 'true';
-
-    if (trigger.requiresExistingTriggerConfirmation && !confirmed) {
-      const payload = JSON.stringify(request);
-      const confirmationCard = CardService.newCardBuilder()
-        .setHeader(CardService.newCardHeader().setTitle('Replace Schedule?'))
-        .addSection(
-          CardService.newCardSection()
-            .addWidget(CardService.newTextParagraph().setText(
-              'Existing retention triggers must be replaced to manage this ' +
-                'schedule from the sidebar.',
-            ))
-            .addWidget(
-              CardService.newButtonSet()
-                .addButton(
-                  CardService.newTextButton()
-                    .setText('Replace Triggers')
-                    .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-                    .setOnClickAction(
-                      CardService.newAction()
-                        .setFunctionName('confirmRetentionSidebarSettings')
-                        .setParameters({ payload }),
-                    ),
-                )
-                .addButton(
-                  CardService.newTextButton()
-                    .setText('Cancel')
-                    .setOnClickAction(
-                      CardService.newAction()
-                        .setFunctionName('cancelRetentionSidebarConfirmation'),
-                    ),
-                ),
-            ),
-        )
-        .build();
-      return CardService.newActionResponseBuilder()
-        .setNavigation(CardService.newNavigation().pushCard(confirmationCard))
-        .build();
-    }
-
-    applyRetentionSidebarSettings_(request, confirmed);
-    return buildSidebarActionResponse_('Settings saved.');
-  } catch (error) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(getRuntimeErrorMessage(error)),
-      )
-      .build();
-  }
-}
-
-/** Applies a confirmed sidebar save carried by the confirmation card. */
-function confirmRetentionSidebarSettings(event) {
-  assertAdminOwnerAccess();
-  try {
-    const payload = getSidebarActionParameter_(event, 'payload', '');
-    const request = JSON.parse(payload);
-    request.settings = validateRetentionSettings(request.settings);
-    request.preferences = validateRetentionSchedulePreferences(
-      request.preferences,
-    );
-    applyRetentionSidebarSettings_(request, true);
-    return CardService.newActionResponseBuilder()
-      .setNavigation(
-        CardService.newNavigation()
-          .popCard()
-          .updateCard(buildRetentionSidebarCard_()),
-      )
-      .setNotification(CardService.newNotification().setText('Settings saved.'))
-      .build();
-  } catch (error) {
-    return CardService.newActionResponseBuilder()
-      .setNotification(
-        CardService.newNotification().setText(getRuntimeErrorMessage(error)),
-      )
-      .build();
-  }
-}
-
-/** Cancels the trigger-replacement confirmation card. */
-function cancelRetentionSidebarConfirmation() {
-  return CardService.newActionResponseBuilder()
-    .setNavigation(CardService.newNavigation().popCard())
-    .build();
 }
 
 /** @return {?Object} Valid queued sidebar-run metadata. */
@@ -4156,7 +4189,7 @@ function prepareQueuedRetentionRun_(event) {
 
 /** Queues retention from Gmail and refreshes the card immediately. */
 function runRetentionFromSidebar() {
-  assertAdminOwnerAccess();
+  assertInstallationOwnerAccess();
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(RETENTION_CONFIG.LOCK_TIMEOUT_MS)) {
     return buildSidebarActionResponse_(
@@ -4258,36 +4291,13 @@ function runRetentionFromSidebar() {
 
 /** Refreshes background-run state without starting another scan. */
 function refreshRetentionSidebarStatus() {
-  assertAdminOwnerAccess();
+  assertInstallationOwnerAccess();
   return buildSidebarActionResponse_();
 }
 
-/**
- * Saves the administration-page color theme independently from retention
- * settings so switching appearance never creates unsaved retention changes.
- *
- * @param {string} theme Requested dark or light theme.
- * @return {{theme: string}} Saved preference.
- */
-function saveAdminTheme(theme) {
-  assertAdminOwnerAccess();
-  return saveRetentionAdminPreferences({ theme });
-}
-
-/**
- * Saves admin-page settings after server validation. Root-label changes rename
- * the existing Gmail label tree in place so filter references remain valid.
- *
- * @param {Object} request Settings and risk acknowledgements from the webpage.
- * @return {Object} Saved settings and timestamp.
- */
-function saveAdminPageSettings(request) {
-  return saveAdminPageSettings_(request, false);
-}
-
 /** Applies validated settings, optionally using a lock already held by the caller. */
-function saveAdminPageSettings_(request, lockHeld) {
-  assertAdminOwnerAccess();
+function saveRetentionCardSettings_(request, lockHeld) {
+  assertInstallationOwnerAccess();
 
   if (!isConfigurationObject(request)) {
     throw new Error('The settings request must be an object.');
@@ -4344,7 +4354,7 @@ function saveAdminPageSettings_(request, lockHeld) {
       settings: savedSettings,
       rootRename,
       systemLabelColor: applyConfiguredSystemNotificationLabelColor_(),
-      backups: getRetentionSettingsBackupsForAdmin(),
+      backups: getRetentionSettingsBackups(),
       savedAt: new Date().toISOString(),
     };
   } finally {
@@ -4363,8 +4373,8 @@ function saveAdminPageSettings_(request, lockHeld) {
  * @param {Object} request Backup ID and explicit acknowledgements.
  * @return {Object} Restored settings, refreshed backups, and timestamp.
  */
-function restoreRetentionSettingsBackupFromAdmin(request) {
-  assertAdminOwnerAccess();
+function restoreRetentionSettingsBackup(request) {
+  assertInstallationOwnerAccess();
 
   if (!isConfigurationObject(request) || request.confirmRestore !== true) {
     throw new Error('Confirm that the selected backup should be restored.');
@@ -4425,7 +4435,7 @@ function restoreRetentionSettingsBackupFromAdmin(request) {
       settings: savedSettings,
       rootRename,
       systemLabelColor: applyConfiguredSystemNotificationLabelColor_(),
-      backups: getRetentionSettingsBackupsForAdmin(),
+      backups: getRetentionSettingsBackups(),
       restoredBackupId: backup.id,
       restoredAt: new Date().toISOString(),
     };
@@ -4453,15 +4463,16 @@ function retentionSchedulePreferencesEqual(first, second) {
 
 /**
  * Validates and applies one schedule operation while holding the script lock.
- * A replacement trigger is created and recorded before the prior trigger is
- * removed, preventing a failed creation from disabling a working schedule.
+ * Existing retention triggers are removed before creating a replacement so the
+ * add-on never temporarily exceeds Google's per-user clock-trigger limit. If
+ * creation fails, the prior managed schedule is restored when possible.
  *
  * @param {Object} request Schedule preferences and confirmations.
  * @param {boolean} repairOnly Whether this is an explicit repair action.
  * @return {Object} Refreshed trigger state and operation type.
  */
-function applyRetentionScheduleFromAdmin(request, repairOnly, lockHeld = false) {
-  assertAdminOwnerAccess();
+function applyRetentionSchedule(request, repairOnly, lockHeld = false) {
+  assertInstallationOwnerAccess();
 
   if (!isConfigurationObject(request)) {
     throw new Error('The schedule request must be an object.');
@@ -4478,6 +4489,12 @@ function applyRetentionScheduleFromAdmin(request, repairOnly, lockHeld = false) 
   }
 
   try {
+    if (isRetentionRunPending_(getRetentionRuntimeState())) {
+      throw new Error(
+        'The schedule cannot be changed while a retention scan is queued or ' +
+          'running. Wait for the scan to finish and try again.',
+      );
+    }
     const beforeStatus = getRetentionTriggerStatus();
     const beforeConfiguration = getRetentionScheduleConfiguration();
     const existingTriggers = getRetentionClockTriggers();
@@ -4551,6 +4568,8 @@ function applyRetentionScheduleFromAdmin(request, repairOnly, lockHeld = false) 
       };
     }
 
+    existingTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+
     let newTrigger = null;
     try {
       newTrigger = createManagedRetentionTrigger(preferences);
@@ -4568,10 +4587,38 @@ function applyRetentionScheduleFromAdmin(request, repairOnly, lockHeld = false) 
           );
         }
       }
-      throw error;
+      let rollbackError = null;
+      if (
+        beforeConfiguration.configured &&
+        beforeConfiguration.preferences.enabled &&
+        managedTrigger
+      ) {
+        try {
+          const restoredTrigger = createManagedRetentionTrigger(
+            beforeConfiguration.preferences,
+          );
+          saveRetentionScheduleConfiguration(
+            beforeConfiguration.preferences,
+            restoredTrigger.getUniqueId(),
+          );
+        } catch (restoreError) {
+          rollbackError = restoreError;
+          saveRetentionScheduleConfiguration(
+            beforeConfiguration.preferences,
+            null,
+          );
+        }
+      }
+      throw new Error(
+        `Unable to create the updated schedule: ${getRuntimeErrorMessage(error)}` +
+          (rollbackError
+            ? ` The prior schedule also could not be restored: ` +
+              getRuntimeErrorMessage(rollbackError)
+            : managedTrigger
+              ? ' The prior schedule was restored.'
+              : ''),
+      );
     }
-
-    existingTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
 
     const action = repairOnly
       ? 'repaired'
@@ -4597,8 +4644,8 @@ function applyRetentionScheduleFromAdmin(request, repairOnly, lockHeld = false) 
  * @param {Object} request Schedule preferences and confirmations.
  * @return {Object} Refreshed trigger state.
  */
-function saveRetentionScheduleFromAdmin(request) {
-  return applyRetentionScheduleFromAdmin(request, false);
+function saveRetentionSchedule(request) {
+  return applyRetentionSchedule(request, false);
 }
 
 /**
@@ -4607,43 +4654,8 @@ function saveRetentionScheduleFromAdmin(request) {
  * @param {Object} request Schedule preferences and confirmations.
  * @return {Object} Refreshed trigger state.
  */
-function repairRetentionScheduleFromAdmin(request) {
-  return applyRetentionScheduleFromAdmin(request, true);
-}
-
-/**
- * Runs retention from the admin page and returns refreshed operational data.
- *
- * @return {Object} Run result plus current runtime and trigger status.
- */
-function runRetentionFromAdmin(runId) {
-  assertAdminOwnerAccess();
-  const pendingRuntime = getRetentionRuntimeState();
-  if (isRetentionRunPending_(pendingRuntime)) {
-    return {
-      result: {
-        status: 'skipped',
-        reason: pendingRuntime.lastRunStatus === 'queued'
-          ? 'A retention run is already queued.'
-          : 'A retention run is already in progress.',
-      },
-      runtime: {
-        ...pendingRuntime,
-        runPending: true,
-      },
-      trigger: getRetentionTriggerStatus(),
-    };
-  }
-  const normalizedRunId = typeof runId === 'string' && runId.trim()
-    ? runId.trim().slice(0, 200)
-    : Utilities.getUuid();
-  const result = enforceGmailRetention(undefined, normalizedRunId);
-
-  return {
-    result,
-    runtime: getRetentionRuntimeStateForClient_(),
-    trigger: getRetentionTriggerStatus(),
-  };
+function repairRetentionSchedule(request) {
+  return applyRetentionSchedule(request, true);
 }
 
 /**
@@ -4706,11 +4718,11 @@ function getSystemNotificationLabelName() {
  * Full update semantics are intentional: omitting color clears a prior custom
  * color, while preserving the label name and visibility settings.
  *
- * @param {Object} label Gmail API compatibility label.
+ * @param {Object} label Gmail API label resource.
  * @return {{status: string, color: string}}
  */
 function applyConfiguredSystemNotificationLabelColor_(label) {
-  const systemLabel = label || GmailApiApp.getUserLabelByName(
+  const systemLabel = label || getGmailUserLabelByName_(
     getSystemNotificationLabelName(),
   );
   const configuredColor = getRetentionSettings()
@@ -4721,7 +4733,7 @@ function applyConfiguredSystemNotificationLabelColor_(label) {
   }
 
   try {
-    const resource = Gmail.Users.Labels.get('me', systemLabel.getId());
+    const resource = Gmail.Users.Labels.get('me', systemLabel.id);
     const colorDefinition = getGmailLabelColorDefinition(configuredColor);
     const currentBackground = resource && resource.color &&
       typeof resource.color.backgroundColor === 'string'
@@ -4751,8 +4763,8 @@ function applyConfiguredSystemNotificationLabelColor_(label) {
         textColor: colorDefinition.textColor,
       };
     }
-    Gmail.Users.Labels.update(updateResource, 'me', systemLabel.getId());
-    invalidateGmailApiCaches_();
+    Gmail.Users.Labels.update(updateResource, 'me', systemLabel.id);
+    invalidateGmailCaches_();
     return { status: 'applied', color: configuredColor };
   } catch (error) {
     console.error(
@@ -4791,61 +4803,6 @@ function getRetentionLabelPattern() {
 function getProjectReleaseUrl() {
   return `${RETENTION_CONFIG.PROJECT_REPOSITORY_URL}/releases/tag/` +
     `v${encodeURIComponent(RETENTION_CONFIG.VERSION)}`;
-}
-
-/**
- * Returns the stable deployed admin-page URL when this project is a web app.
- * Missing deployment metadata must never prevent a retention notification.
- *
- * @return {string} Deployed web-app URL, or an empty string when unavailable.
- */
-function getAdminPageUrl() {
-  const storedUrl = PropertiesService.getScriptProperties().getProperty(
-    RETENTION_ADMIN_PAGE_URL_PROPERTY_KEY,
-  );
-  return normalizeAdminPageUrl_(storedUrl);
-}
-
-/**
- * Accepts only a deployed Apps Script web-app /exec URL. Deployment-context
- * discovery is intentionally avoided because an add-on execution can resolve
- * ScriptApp.getService().getUrl() to a library or add-on URL instead.
- *
- * @param {*} value Candidate URL.
- * @return {string} Validated web-app URL, or an empty string.
- */
-function normalizeAdminPageUrl_(value) {
-  const url = typeof value === 'string' ? value.trim() : '';
-  return /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(
-    url,
-  )
-    ? url
-    : '';
-}
-
-/** Saves a manually supplied production web-app URL from the Gmail sidebar. */
-function saveRetentionAdminPageUrl(event) {
-  assertAdminOwnerAccess();
-  const submittedUrl = getSidebarFormString_(event, 'adminPageUrl', '');
-  const adminPageUrl = normalizeAdminPageUrl_(submittedUrl);
-  if (!adminPageUrl) {
-    const response = CardService.newActionResponseBuilder().setNavigation(
-      CardService.newNavigation().updateCard(
-        buildRetentionSidebarCard_({ adminPageUrl: submittedUrl }),
-      ),
-    );
-    response.setNotification(
-      CardService.newNotification().setText(
-        'Enter the deployed Web app URL ending in /exec.',
-      ),
-    );
-    return response.build();
-  }
-  PropertiesService.getScriptProperties().setProperty(
-    RETENTION_ADMIN_PAGE_URL_PROPERTY_KEY,
-    adminPageUrl,
-  );
-  return buildSidebarActionResponse_('Advanced Settings URL saved.');
 }
 
 /**
@@ -5286,7 +5243,6 @@ function getPendingManagedSystemEmails_() {
     return parsed.emails.filter(item =>
       isConfigurationObject(item) &&
       typeof item.messageId === 'string' && item.messageId &&
-      typeof item.threadId === 'string' && item.threadId &&
       typeof item.systemLabelName === 'string' && item.systemLabelName &&
       typeof item.retentionLabelName === 'string' && item.retentionLabelName,
     );
@@ -5294,6 +5250,9 @@ function getPendingManagedSystemEmails_() {
     console.error(
       `Ignoring invalid ${RETENTION_PENDING_SYSTEM_EMAILS_PROPERTY_KEY}: ` +
         getRuntimeErrorMessage(error),
+    );
+    PropertiesService.getScriptProperties().deleteProperty(
+      RETENTION_PENDING_SYSTEM_EMAILS_PROPERTY_KEY,
     );
     return [];
   }
@@ -5330,26 +5289,53 @@ function forgetPendingManagedSystemEmail_(messageId) {
   );
 }
 
-/** Applies the managed labels and Inbox state; the operation is safe to retry. */
-function applyManagedSystemEmailState_(entry) {
+/**
+ * Applies managed state to the exact notification message. A user moving that
+ * message to Trash is authoritative: recovery then completes without restoring
+ * the message or changing its read state.
+ *
+ * @param {Object} entry Pending message and label metadata.
+ * @param {boolean} placeInInbox Whether the immediate post-send call may add
+ *   Inbox and unread state. Delayed retries always pass false.
+ * @return {Object} Whether managed state was applied.
+ */
+function applyManagedSystemEmailState_(entry, placeInInbox) {
+  const message = executeGmailApiWithRetry_(() =>
+    Gmail.Users.Messages.get('me', entry.messageId, { format: 'minimal' }),
+  );
+  const labelIds = Array.isArray(message.labelIds) ? message.labelIds : [];
+  if (labelIds.includes('TRASH')) {
+    console.log(
+      `Managed system email ${entry.messageId} is in Trash; respecting the ` +
+        'user action and cancelling post-send Inbox recovery.',
+    );
+    return { applied: false, reason: 'message_in_trash' };
+  }
   const systemLabel = getOrCreateLabel(entry.systemLabelName);
   const retentionLabel = getOrCreateLabel(entry.retentionLabelName);
-  executeGmailApiWithRetry_(() => Gmail.Users.Threads.modify(
+  executeGmailApiWithRetry_(() => Gmail.Users.Messages.modify(
     {
-      addLabelIds: [systemLabel.getId(), retentionLabel.getId(), 'INBOX', 'UNREAD'],
+      addLabelIds: [
+        systemLabel.id,
+        retentionLabel.id,
+        ...(placeInInbox ? ['INBOX', 'UNREAD'] : []),
+      ],
       removeLabelIds: ['SPAM'],
     },
     'me',
-    entry.threadId,
+    entry.messageId,
   ));
-  invalidateGmailApiCaches_();
+  invalidateGmailCaches_();
+  return { applied: true, reason: 'managed_state_applied' };
 }
 
 /** Retries post-send Gmail work without resending already-delivered emails. */
 function retryPendingManagedSystemEmails_() {
   for (const entry of getPendingManagedSystemEmails_()) {
     try {
-      applyManagedSystemEmailState_(entry);
+      // A delayed retry repairs only application labels. It never re-adds
+      // Inbox or unread state after the user has had an opportunity to act.
+      applyManagedSystemEmailState_(entry, false);
       forgetPendingManagedSystemEmail_(entry.messageId);
     } catch (error) {
       console.error(
@@ -5538,7 +5524,7 @@ function getDeletionReportOutbox_() {
 function finalizePlannedDeletionReport_(outbox) {
   const records = outbox.records.filter(record => {
     try {
-      const message = executeGmailApiReadWithRetry_(() =>
+      const message = executeGmailApiWithRetry_(() =>
         Gmail.Users.Messages.get('me', record.messageId, { format: 'minimal' }),
       );
       return Array.isArray(message.labelIds) && message.labelIds.includes('TRASH');
@@ -5624,8 +5610,8 @@ function escapeRegExp(value) {
 
 /**
  * Main entry point. Configure a daily time-driven trigger for this function.
- * The returned object is ignored by scheduled triggers and displayed by the
- * admin page after a manual run.
+ * The returned object is ignored by scheduled triggers and shown by the Gmail
+ * card after a manual run.
  *
  * @param {Object=} event Apps Script trigger event for scheduled executions.
  * @return {Object} Serializable outcome of the retention run.
@@ -5807,18 +5793,11 @@ function enforceGmailRetention(event, requestedRunId) {
     }
 
     if (!result.scanComplete) {
-      const continuation = getRetentionContinuationState_();
-      scheduleRetentionContinuation_(
-        continuation.nextOffset,
-        continuation.totals,
-        RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS,
-        runId,
-      );
-      result.status = 'continuing';
-      result.continuationQueued = true;
-      result.nextContinuationAt = new Date(
-        Date.now() + RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS,
-      ).toISOString();
+      result.status = 'paused';
+      result.continuationQueued = false;
+      result.nextContinuationAt = null;
+      result.reason = 'The checkpoint was saved. Select Continue Retention ' +
+        'Scan, or allow the next scheduled scan to resume it.';
     }
     const completedAt = new Date();
     const completedResult = {
@@ -5831,7 +5810,7 @@ function enforceGmailRetention(event, requestedRunId) {
       lastRunStatus: result.status,
       lastRunCompletedAt: completedAt.toISOString(),
       lastResult: completedResult,
-      activeRunId: result.scanComplete ? null : runId,
+      activeRunId: null,
     };
 
     if (runSource === 'scheduled') {
@@ -5866,20 +5845,12 @@ function enforceGmailRetention(event, requestedRunId) {
         const deferredTotals = {
           ...continuation.totals,
           quotaPauseCount: continuation.totals.quotaPauseCount + 1,
-          quotaWaitMilliseconds:
-            continuation.totals.quotaWaitMilliseconds +
-            RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS,
+          quotaWaitMilliseconds: continuation.totals.quotaWaitMilliseconds,
         };
         saveRetentionContinuationCheckpoint_(
           continuation.nextOffset,
           continuation.totalConversationCount,
           deferredTotals,
-          runId,
-        );
-        scheduleRetentionContinuation_(
-          continuation.nextOffset,
-          deferredTotals,
-          RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS,
           runId,
         );
         const pausedAt = new Date();
@@ -5888,8 +5859,7 @@ function enforceGmailRetention(event, requestedRunId) {
         const remaining = Math.max(0, total - reviewed);
         const elapsedMs = pausedAt.getTime() - passStartedAt.getTime();
         const estimatedRemainingMs = reviewed > 0
-          ? Math.round((elapsedMs / reviewed) * remaining) +
-            RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS
+          ? Math.round((elapsedMs / reviewed) * remaining)
           : null;
         const pausedResult = {
           ...deferredTotals,
@@ -5901,17 +5871,15 @@ function enforceGmailRetention(event, requestedRunId) {
           progressPercent: total > 0
             ? Math.min(100, Math.round((reviewed / total) * 100))
             : 0,
-          continuationQueued: true,
-          nextContinuationAt: new Date(
-            pausedAt.getTime() +
-              RETENTION_CONFIG.RUNTIME_CONTINUATION_DELAY_MS,
-          ).toISOString(),
+          continuationQueued: false,
+          nextContinuationAt: null,
           estimatedCompletionAt: estimatedRemainingMs === null
             ? null
             : new Date(
               pausedAt.getTime() + estimatedRemainingMs,
             ).toISOString(),
-          reason: 'Gmail quota reached; processing will resume automatically.',
+          reason: 'The Gmail quota checkpoint was saved. Select Continue ' +
+            'Retention Scan, or allow the next scheduled scan to resume it.',
           startedAt: passStartedAt.toISOString(),
           completedAt: pausedAt.toISOString(),
         };
@@ -5919,7 +5887,7 @@ function enforceGmailRetention(event, requestedRunId) {
           lastRunSource: runSource,
           lastRunStatus: 'paused',
           lastRunCompletedAt: pausedAt.toISOString(),
-          activeRunId: runId,
+          activeRunId: null,
           lastResult: pausedResult,
         });
         return pausedResult;
@@ -5980,6 +5948,7 @@ function executeGmailRetention_(runId) {
         systemNotificationLabel:
           getSystemNotificationLabelName(),
         archiveOnLabel: settings.ARCHIVE_ON_LABEL,
+        protectStarredMessages: settings.PROTECT_STARRED_MESSAGES,
       },
     }));
 
@@ -6007,7 +5976,7 @@ function executeGmailRetention_(runId) {
       'DISCOVERY',
       () => (`Discovered ${discoveredRetentionLabels.length} valid retention policy label(s).`),
     );
-    const systemNotificationLabel = GmailApiApp.getUserLabelByName(
+    const systemNotificationLabel = getGmailUserLabelByName_(
       getSystemNotificationLabelName(),
     );
 
@@ -6063,6 +6032,8 @@ function executeGmailRetention_(runId) {
     const allThreadMap = collectUniqueThreads(
       discoveredRetentionLabels,
       systemNotificationLabel,
+      now,
+      retentionTimeZone,
     );
     verboseLog('THREAD COLLECTION', () => (`Collected ${allThreadMap.size} unique thread(s).`));
     const processingBatch = selectGmailThreadProcessingBatch_(allThreadMap);
@@ -6080,7 +6051,7 @@ function executeGmailRetention_(runId) {
       runId,
     );
     try {
-      preflightGmailApiThreads_(threadMap);
+      preflightGmailThreads_(threadMap);
     } catch (error) {
       if (isGmailApiQuotaError_(error)) {
         throw new Error(
@@ -6095,32 +6066,42 @@ function executeGmailRetention_(runId) {
     const excludedArchiveMessageIds = new Set();
     let removedRetentionLabelCount = 0;
 
-    for (const thread of threadMap.values()) {
-      verboseLog('THREAD', () => (`Processing thread ${thread.getId()}.`));
-      const threadLabels = thread.getLabels();
-      const threadIsInTrash = thread.isInTrash();
-      const messages = thread.getMessages();
+    for (const threadReference of threadMap.values()) {
+      const threadId = threadReference.id;
+      const thread = getGmailThread_(threadId);
+      verboseLog('THREAD', () => (`Processing thread ${threadId}.`));
+      const threadLabels = getThreadUserLabels_(thread);
+      const messages = Array.isArray(thread.messages) ? thread.messages : [];
+      const threadIsInTrash = messages.some(message =>
+        messageHasLabel_(message, 'TRASH'),
+      );
       verboseLog('THREAD LABELS', () => ({
-        threadId: thread.getId(),
-        labels: threadLabels.map(label => label.getName()),
+        threadId,
+        labels: threadLabels.map(label => label.name),
         isInTrash: threadIsInTrash,
       }));
       const isSystemNotification = threadLabels.some(
-        label => labelNamesEqual(label.getName(), getSystemNotificationLabelName()),
+        label => labelNamesEqual(label.name, getSystemNotificationLabelName()),
       );
 
-      const activeMessages = messages.filter(message => !message.isInTrash());
+      const activeMessages = messages.filter(message =>
+        !messageHasLabel_(message, 'TRASH'),
+      );
+      const messagesToTrash = settings.PROTECT_STARRED_MESSAGES
+        ? activeMessages.filter(message => !messageHasLabel_(message, 'STARRED'))
+        : activeMessages;
       if (isSystemNotification) {
         activeMessages.forEach(message => {
-          excludedArchiveMessageIds.add(message.getId());
+          excludedArchiveMessageIds.add(message.id);
         });
       }
       verboseLog('THREAD MESSAGES', () => ({
-        threadId: thread.getId(),
+        threadId,
         messageCount: messages.length,
         activeMessageCount: activeMessages.length,
         trashedMessageCount: messages.length - activeMessages.length,
-        subjects: messages.map(message => message.getSubject() || '(no subject)'),
+        subjects: messages.map(message =>
+          getGmailHeader_(message, 'Subject') || '(no subject)'),
       }));
 
       /*
@@ -6132,7 +6113,7 @@ function executeGmailRetention_(runId) {
        */
       if (activeMessages.length === 0) {
         verboseLog('THREAD TRASH STATE', () => ({
-          threadId: thread.getId(),
+          threadId,
           threadIsInTrash,
           isSystemNotification,
           action: isSystemNotification
@@ -6140,14 +6121,26 @@ function executeGmailRetention_(runId) {
             : 'Skip conversation with no active messages',
         }));
         if (isSystemNotification) {
-          removeSystemNotificationLabels(thread);
+          removeSystemNotificationLabels(threadId);
         }
+        continue;
+      }
+
+      if (messagesToTrash.length === 0) {
+        verboseLog('STARRED MESSAGE PROTECTION', () => ({
+          threadId,
+          protectedMessageCount: activeMessages.length,
+          action: 'Skip conversation because every active message is starred',
+        }));
+        activeMessages.forEach(message => {
+          excludedArchiveMessageIds.add(message.id);
+        });
         continue;
       }
 
       if (threadIsInTrash) {
         verboseLog('THREAD TRASH STATE', () => ({
-          threadId: thread.getId(),
+          threadId,
           threadIsInTrash,
           activeMessageCount: activeMessages.length,
           action: 'Process active messages in mixed-state conversation',
@@ -6156,9 +6149,9 @@ function executeGmailRetention_(runId) {
 
       const newestMessage = getNewestMessage(messages);
       verboseLog('THREAD NEWEST MESSAGE', () => ({
-        threadId: thread.getId(),
-        subject: newestMessage.getSubject() || '(no subject)',
-        date: newestMessage.getDate().toISOString(),
+        threadId,
+        subject: getGmailHeader_(newestMessage, 'Subject') || '(no subject)',
+        date: new Date(Number(newestMessage.internalDate)).toISOString(),
       }));
 
       let policies = threadLabels
@@ -6166,7 +6159,7 @@ function executeGmailRetention_(runId) {
         .filter(policy => policy !== null);
 
       verboseLog('THREAD POLICIES', () => ({
-        threadId: thread.getId(),
+        threadId,
         policies: policies.map(policy => ({
           labelName: policy.labelName,
           amount: policy.amount,
@@ -6181,7 +6174,7 @@ function executeGmailRetention_(runId) {
        * required retention label is missing.
        */
       if (isSystemNotification) {
-        policies = ensureSystemNotificationPolicy(thread, policies);
+        policies = ensureSystemNotificationPolicy(threadId, policies);
       }
 
       if (policies.length === 0) {
@@ -6191,13 +6184,13 @@ function executeGmailRetention_(runId) {
 
       const winningPolicy = chooseWinningPolicy(
         policies,
-        newestMessage.getDate(),
+        new Date(Number(newestMessage.internalDate)),
         isSystemNotification,
         retentionTimeZone,
       );
 
       verboseLog('WINNING POLICY', () => ({
-        threadId: thread.getId(),
+        threadId,
         labelName: winningPolicy.labelName,
         expiresAt: winningPolicy.expiresAt.toISOString(),
         now: now.toISOString(),
@@ -6205,20 +6198,20 @@ function executeGmailRetention_(runId) {
 
       // Keep exactly one valid retention label to eliminate conflicting UI state.
       for (const policy of policies) {
-        if (policy.label.getId() !== winningPolicy.label.getId()) {
+        if (policy.label.id !== winningPolicy.label.id) {
           verboseLog('REMOVE REDUNDANT LABEL', () => ({
-            threadId: thread.getId(),
+            threadId,
             removedLabel: policy.labelName,
             retainedLabel: winningPolicy.labelName,
           }));
-          policy.label.removeFromThread(thread);
+          modifyThreadLabels_(threadId, [], [policy.label.id]);
           removedRetentionLabelCount += 1;
         }
       }
 
       if (now.getTime() < winningPolicy.expiresAt.getTime()) {
         verboseLog('RETENTION DECISION', () => ({
-          threadId: thread.getId(),
+          threadId,
           decision: 'KEEP',
           expiresAt: winningPolicy.expiresAt.toISOString(),
         }));
@@ -6226,7 +6219,7 @@ function executeGmailRetention_(runId) {
       }
 
       verboseLog('RETENTION DECISION', () => ({
-        threadId: thread.getId(),
+        threadId,
         decision: 'MOVE_TO_TRASH',
         expiredAt: winningPolicy.expiresAt.toISOString(),
       }));
@@ -6238,27 +6231,28 @@ function executeGmailRetention_(runId) {
        */
       const trashPermalink = isSystemNotification
         ? ''
-        : buildTrashPermalink(thread, notificationRecipient);
+        : buildTrashPermalink(threadId, notificationRecipient);
       const messageRecords = isSystemNotification
         ? []
-        : activeMessages.map(message => ({
-            messageId: message.getId(),
-            subject: message.getSubject() || '(no subject)',
-            sender: message.getFrom() || '(unknown sender)',
-            receivedAt: message.getDate(),
+        : messagesToTrash.map(message => ({
+            messageId: message.id,
+            subject: getGmailHeader_(message, 'Subject') || '(no subject)',
+            sender: getGmailHeader_(message, 'From') || '(unknown sender)',
+            receivedAt: new Date(Number(message.internalDate)),
             retentionLabel: winningPolicy.labelName,
             trashPermalink,
           }));
 
       pendingDeletions.push({
-        thread,
-        messagesToTrash: activeMessages,
+        threadId,
+        messagesToTrash,
         messageRecords,
         isSystemNotification,
-        trashWholeThread: !threadIsInTrash,
+        trashWholeThread:
+          !threadIsInTrash && messagesToTrash.length === activeMessages.length,
       });
-      activeMessages.forEach(message => {
-        excludedArchiveMessageIds.add(message.getId());
+      messagesToTrash.forEach(message => {
+        excludedArchiveMessageIds.add(message.id);
       });
     }
 
@@ -6427,7 +6421,7 @@ function executeGmailRetention_(runId) {
  * Once that parent exists, this function never recreates missing sublabels,
  * because the user may have intentionally removed or replaced the defaults.
  *
- * @return {GmailLabel[]} Labels created during this run. Returns an empty array
+ * @return {Object[]} Gmail API label resources created during this run.
  *   when the configured root label already exists.
  */
 function initializeDefaultRetentionLabels() {
@@ -6474,7 +6468,7 @@ function initializeDefaultRetentionLabels() {
   verboseLabelSnapshot('LABELS BEFORE STARTER VERIFICATION');
   const missingLabelNames = requestedLabelNames.filter(labelName =>
     !createdLabels.some(
-      label => normalizeRetentionLabelName(label.getName()).toLowerCase() ===
+      label => normalizeRetentionLabelName(label.name).toLowerCase() ===
         normalizeRetentionLabelName(labelName).toLowerCase(),
     ),
   );
@@ -6491,51 +6485,33 @@ function initializeDefaultRetentionLabels() {
 }
 
 /**
- * Read-only diagnostic entry point. It discovers labels but never creates labels
- * or reads, relabels, or trashes Gmail conversations.
- */
-function runRetentionLabelDiagnostics() {
-  console.log(
-    `Starting label diagnostics for ${RETENTION_CONFIG.APPLICATION_NAME} ` +
-      `${RETENTION_CONFIG.VERSION}.`,
-  );
-  verboseLabelSnapshot('DIAGNOSTIC INITIAL LABEL SNAPSHOT');
-  const policies = discoverRetentionLabels();
-  verboseLabelSnapshot('DIAGNOSTIC FINAL LABEL SNAPSHOT');
-  console.log(
-    `Label diagnostics complete. Recognized ${policies.length} valid ` +
-      `retention label(s): ${policies.map(policy => policy.labelName).join(', ') || '(none)'}.`,
-  );
-}
-
-/**
  * Finds every user-created Gmail label matching the supported retention format.
  * This is what allows new retention periods to work without code changes.
  *
  * Labels created moments earlier are accepted as an optional argument. Including
- * them directly avoids depending on GmailApiApp.getUserLabels() reflecting new
+ * them directly avoids depending on a fresh Gmail label-list request reflecting new
  * labels immediately within the same execution.
  *
- * @param {GmailLabel[]} initializedLabels Labels created during this run.
- * @return {{label: GmailLabel, amount: number, unit: string, labelName: string}[]}
+ * @param {Object[]} initializedLabels Label resources created during this run.
+ * @return {{label: Object, amount: number, unit: string, labelName: string}[]}
  */
 function discoverRetentionLabels(initializedLabels = []) {
   verboseLog('DISCOVERY', () => ({
     initializedLabelCount: initializedLabels.length,
-    initializedLabels: initializedLabels.map(label => label.getName()),
+    initializedLabels: initializedLabels.map(label => label.name),
   }));
   const labelsByName = new Map();
 
-  const gmailLabels = GmailApiApp.getUserLabels();
+  const gmailLabels = getGmailUserLabels_();
   verboseLog('DISCOVERY RAW GMAIL LABELS', () => (gmailLabels.map(describeLabel)));
 
   for (const label of [
     ...gmailLabels,
     ...initializedLabels,
   ]) {
-    const normalizedName = normalizeRetentionLabelName(label.getName());
+    const normalizedName = normalizeRetentionLabelName(label.name);
     verboseLog('DISCOVERY NORMALIZE LABEL', () => ({
-      rawName: label.getName(),
+      rawName: label.name,
       normalizedName,
       id: safeGetLabelId(label),
     }));
@@ -6556,7 +6532,7 @@ function discoverRetentionLabels(initializedLabels = []) {
     );
   } else {
     const retentionLikeLabels = allLabels
-      .map(label => label.getName())
+      .map(label => label.name)
       .filter(labelName =>
         normalizeRetentionLabelName(labelName)
           .toLowerCase()
@@ -6579,11 +6555,11 @@ function discoverRetentionLabels(initializedLabels = []) {
  * include Retention/30d, Retention/30 days, Retention/2yr, and Retention/2 years
  * when the default root label is used.
  *
- * @param {GmailLabel} label Gmail label to inspect.
- * @return {{label: GmailLabel, amount: number, unit: string, labelName: string}|null}
+ * @param {Object} label Gmail API label resource to inspect.
+ * @return {{label: Object, amount: number, unit: string, labelName: string}|null}
  */
 function parseRetentionLabel(label) {
-  const labelName = label.getName();
+  const labelName = label.name;
   const normalizedLabelName = normalizeRetentionLabelName(labelName);
   const match = normalizedLabelName.match(getRetentionLabelPattern());
 
@@ -6663,14 +6639,21 @@ function normalizeRetentionLabelName(value) {
 }
 
 /**
- * Retrieves all threads attached to all discovered retention labels and removes
- * duplicate thread references caused by overlapping labels.
+ * Queries only expiration candidates for each discovered retention label and
+ * removes duplicate thread references caused by overlapping labels. Full
+ * metadata is fetched later, and the winning-policy calculation remains
+ * authoritative before any Gmail state is changed.
  *
  * @param {Array} retentionPolicies Discovered retention labels and metadata.
- * @param {GmailLabel|null} systemNotificationLabel Internal recovery label.
- * @return {Map<string, GmailThread>} Map keyed by Gmail thread ID.
+ * @param {Object|null} systemNotificationLabel Internal recovery label.
+ * @return {Map<string, Object>} Map keyed by Gmail thread ID.
  */
-function collectUniqueThreads(retentionPolicies, systemNotificationLabel) {
+function collectUniqueThreads(
+  retentionPolicies,
+  systemNotificationLabel,
+  now,
+  timeZone,
+) {
   verboseLog('THREAD COLLECTION INPUT', () => ({
     retentionPolicies: retentionPolicies.map(policy => policy.labelName),
     systemNotificationLabel: describeLabel(systemNotificationLabel),
@@ -6678,14 +6661,82 @@ function collectUniqueThreads(retentionPolicies, systemNotificationLabel) {
   const threadMap = new Map();
 
   for (const policy of retentionPolicies) {
-    addLabelThreadsToMap(policy.label, threadMap);
+    addCandidateLabelThreadsToMap_(
+      policy.label,
+      getRetentionCandidateCutoff_(policy, now, timeZone),
+      threadMap,
+    );
   }
 
   if (systemNotificationLabel) {
-    addLabelThreadsToMap(systemNotificationLabel, threadMap);
+    const notificationPolicy = retentionPolicies.find(policy =>
+      labelNamesEqual(policy.labelName, getNotificationRetentionLabelName()),
+    ) || parseRetentionLabel(
+      getOrCreateLabel(getNotificationRetentionLabelName()),
+    );
+    if (notificationPolicy) {
+      addCandidateLabelThreadsToMap_(
+        systemNotificationLabel,
+        getRetentionCandidateCutoff_(notificationPolicy, now, timeZone),
+        threadMap,
+      );
+    }
   }
 
   return threadMap;
+}
+
+/**
+ * Finds the newest possible message date that can already be expired. Binary
+ * search deliberately reuses addRetentionPeriod(), preserving its month-end
+ * clamping and daylight-saving behavior for every supported policy unit.
+ */
+function getRetentionCandidateCutoff_(policy, now, timeZone) {
+  const oldestSearchableDate = new Date(0);
+  const oldestExpiration = calculateRetentionExpiration_(
+    oldestSearchableDate,
+    policy.amount,
+    policy.unit,
+    timeZone,
+  ).getTime();
+  if (!Number.isFinite(oldestExpiration) || oldestExpiration > now.getTime()) {
+    return oldestSearchableDate;
+  }
+  let lowMs = oldestSearchableDate.getTime();
+  let highMs = now.getTime();
+  while (lowMs < highMs) {
+    const middleMs = Math.ceil((lowMs + highMs) / 2);
+    const expiresAt = calculateRetentionExpiration_(
+      new Date(middleMs),
+      policy.amount,
+      policy.unit,
+      timeZone,
+    ).getTime();
+    if (expiresAt <= now.getTime()) {
+      lowMs = middleMs;
+    } else {
+      highMs = middleMs - 1;
+    }
+  }
+  return new Date(lowMs);
+}
+
+/** Adds Gmail search candidates for one label to the shared thread map. */
+function addCandidateLabelThreadsToMap_(label, cutoff, threadMap) {
+  const threadIds = listGmailCandidateThreadIds_(label.id, cutoff);
+  verboseLog('QUERY-FIRST CANDIDATES', () => ({
+    labelName: label.name,
+    cutoff: cutoff.toISOString(),
+    returnedThreadCount: threadIds.length,
+  }));
+  threadIds.forEach(threadId => {
+    const retainedThread = threadMap.get(threadId) || {
+      id: threadId,
+      discoveryLabelNames: new Set(),
+    };
+    retainedThread.discoveryLabelNames.add(label.name);
+    threadMap.set(threadId, retainedThread);
+  });
 }
 
 /**
@@ -6693,28 +6744,28 @@ function collectUniqueThreads(retentionPolicies, systemNotificationLabel) {
  * message is changed. A persistent Gmail read failure therefore stops that
  * batch fail-closed instead of producing incomplete retention results.
  */
-function preflightGmailApiThreads_(threadMap) {
+function preflightGmailThreads_(threadMap) {
   verboseLog(
     'THREAD PREFLIGHT',
     () => (`Validating ${threadMap.size} conversation(s) before processing.`),
   );
   for (const thread of threadMap.values()) {
     try {
-      getGmailApiThreadResource_(thread.getId(), false);
+      getGmailThread_(thread.id, false);
     } catch (error) {
-      const labelNames = typeof thread.getDiscoveryLabelNames_ === 'function'
-        ? thread.getDiscoveryLabelNames_()
+      const labelNames = thread.discoveryLabelNames
+        ? [...thread.discoveryLabelNames]
         : [];
       const accountEmail = Session.getEffectiveUser().getEmail() || '';
       const permalink = accountEmail
         ? `https://mail.google.com/mail/u/?authuser=` +
           `${encodeURIComponent(accountEmail)}#all/` +
-          `${encodeURIComponent(thread.getId())}`
+          `${encodeURIComponent(thread.id)}`
         : `https://mail.google.com/mail/u/0/#all/` +
-          `${encodeURIComponent(thread.getId())}`;
+          `${encodeURIComponent(thread.id)}`;
       throw new Error(
         `Retention scan stopped before conversation processing. Gmail could ` +
-          `not read conversation ${thread.getId()} after retries and fallback ` +
+          `not read conversation ${thread.id} after retries and fallback ` +
           `requests. Discovery label(s): ` +
           `${labelNames.join(', ') || '(unknown)'}. Open conversation: ` +
           `${permalink}. No conversation labels were changed and no messages ` +
@@ -6753,57 +6804,14 @@ function selectGmailThreadProcessingBatch_(threadMap) {
 }
 
 /**
- * Adds every thread carrying one label to a shared deduplication map.
- *
- * @param {GmailLabel} label Gmail label to enumerate.
- * @param {Map<string, GmailThread>} threadMap Destination map.
- */
-function addLabelThreadsToMap(label, threadMap) {
-  let start = 0;
-  verboseLog('LABEL THREAD ENUMERATION', () => ({
-    label: describeLabel(label),
-    pageSize: RETENTION_CONFIG.THREAD_PAGE_SIZE,
-  }));
-
-  while (true) {
-    const threads = label.getThreads(
-      start,
-      RETENTION_CONFIG.THREAD_PAGE_SIZE,
-    );
-
-    verboseLog('LABEL THREAD PAGE', () => ({
-      labelName: label.getName(),
-      start,
-      returnedThreadCount: threads.length,
-      threadIds: threads.map(thread => thread.getId()),
-    }));
-
-    for (const thread of threads) {
-      const existingThread = threadMap.get(thread.getId());
-      const retainedThread = existingThread || thread;
-      if (typeof retainedThread.addDiscoveryLabelName_ === 'function') {
-        retainedThread.addDiscoveryLabelName_(label.getName());
-      }
-      threadMap.set(thread.getId(), retainedThread);
-    }
-
-    if (threads.length < RETENTION_CONFIG.THREAD_PAGE_SIZE) {
-      break;
-    }
-
-    start += threads.length;
-  }
-}
-
-/**
  * Returns the most recent message without assuming Gmail's array order.
  *
- * @param {GmailMessage[]} messages Messages in one Gmail conversation.
- * @return {GmailMessage} Most recent message.
+ * @param {Object[]} messages Gmail API message resources.
+ * @return {Object} Most recent message resource.
  */
 function getNewestMessage(messages) {
   return messages.reduce((newest, current) =>
-    current.getDate().getTime() > newest.getDate().getTime()
+    Number(current.internalDate) > Number(newest.internalDate)
       ? current
       : newest,
   );
@@ -6814,11 +6822,11 @@ function getNewestMessage(messages) {
  * retention label. This also repairs a notification if that label was
  * accidentally removed while the internal system label remained.
  *
- * @param {GmailThread} thread Notification thread.
+ * @param {string} threadId Notification thread ID.
  * @param {Array} policies Existing parsed retention policies.
  * @return {Array} Updated policy list.
  */
-function ensureSystemNotificationPolicy(thread, policies) {
+function ensureSystemNotificationPolicy(threadId, policies) {
   const requiredLabelName = getNotificationRetentionLabelName();
   const existingPolicy = policies.find(
     policy => labelNamesEqual(policy.labelName, requiredLabelName),
@@ -6829,7 +6837,7 @@ function ensureSystemNotificationPolicy(thread, policies) {
   }
 
   const requiredLabel = getOrCreateLabel(requiredLabelName);
-  requiredLabel.addToThread(thread);
+  modifyThreadLabels_(threadId, [requiredLabel.id], []);
 
   const parsedPolicy = parseRetentionLabel(requiredLabel);
   if (!parsedPolicy) {
@@ -6961,12 +6969,17 @@ function getZonedDateTimeParts_(date, timeZone) {
  * @return {Date} Calculated expiration date.
  */
 function addRetentionPeriod(startDate, amount, unit, timeZone) {
-  const result = new Date(startDate.getTime());
   verboseLog('ADD RETENTION PERIOD', () => ({
     startDate: startDate.toISOString(),
     amount,
     unit,
   }));
+  return calculateRetentionExpiration_(startDate, amount, unit, timeZone);
+}
+
+/** Internal calendar calculation used by policy evaluation and query cutoffs. */
+function calculateRetentionExpiration_(startDate, amount, unit, timeZone) {
+  const result = new Date(startDate.getTime());
 
   switch (unit) {
     case 'min':
@@ -7058,12 +7071,11 @@ function addUtcCalendarMonthsClamped_(startDate, monthCount) {
  * Example:
  *   https://mail.google.com/mail/u/?authuser=user%40example.com#trash/THREAD_ID
  *
- * @param {GmailThread} thread Gmail conversation being moved to Trash.
+ * @param {string} threadId Gmail conversation ID being moved to Trash.
  * @param {string} accountEmail Owning Gmail address resolved once per run.
  * @return {string} Gmail URL scoped to the owning account and Trash route.
  */
-function buildTrashPermalink(thread, accountEmail) {
-  const threadId = thread.getId();
+function buildTrashPermalink(threadId, accountEmail) {
   const trashPermalink =
     'https://mail.google.com/mail/u/?authuser=' +
     `${encodeURIComponent(accountEmail)}#trash/${encodeURIComponent(threadId)}`;
@@ -7071,7 +7083,6 @@ function buildTrashPermalink(thread, accountEmail) {
   verboseLog('TRASH PERMALINK', () => ({
     threadId,
     accountEmail,
-    originalPermalink: String(thread.getPermalink() || ''),
     trashPermalink,
   }));
 
@@ -7208,7 +7219,7 @@ function archiveRetentionLabeledInboxMessages(
 
   retentionPolicies.forEach(policy => {
     if (policy && policy.label) {
-      uniqueLabels.set(policy.label.getId(), policy.labelName);
+      uniqueLabels.set(policy.label.id, policy.labelName);
     }
   });
   if (uniqueLabels.size === 0) {
@@ -7314,7 +7325,7 @@ function movePendingMessagesToTrash(pendingDeletions) {
   const wholeThreadDeletions = [];
 
   for (const item of pendingDeletions) {
-    if (item.trashWholeThread && typeof item.thread.moveToTrash === 'function') {
+    if (item.trashWholeThread) {
       wholeThreadDeletions.push(item);
       continue;
     }
@@ -7324,7 +7335,7 @@ function movePendingMessagesToTrash(pendingDeletions) {
         messageRecord: item.isSystemNotification
           ? null
           : item.messageRecords[messageIndex],
-        thread: item.thread,
+        threadId: item.threadId,
         isSystemNotification: item.isSystemNotification,
       });
     });
@@ -7333,26 +7344,27 @@ function movePendingMessagesToTrash(pendingDeletions) {
   verboseLog('TRASH', () => ({
     pendingThreadCount: pendingDeletions.length,
     pendingMessageCount: pendingMessages.length,
-    threadIds: pendingDeletions.map(item => item.thread.getId()),
+    threadIds: pendingDeletions.map(item => item.threadId),
   }));
   const deletedMessageRecords = [];
   const movedThreadIds = new Set();
-  const systemNotificationThreads = new Map();
+  const systemNotificationThreads = new Set();
   let movedMessageCount = 0;
   let movedOrdinaryMessageCount = 0;
   let movedSystemMessageCount = 0;
 
   for (const item of wholeThreadDeletions) {
-    item.thread.moveToTrash();
+    executeGmailApiWithRetry_(() => Gmail.Users.Threads.trash('me', item.threadId));
+    gmailThreadCache.delete(item.threadId);
     movedMessageCount += item.messagesToTrash.length;
     if (item.isSystemNotification) {
       movedSystemMessageCount += item.messagesToTrash.length;
     } else {
       movedOrdinaryMessageCount += item.messagesToTrash.length;
     }
-    movedThreadIds.add(item.thread.getId());
+    movedThreadIds.add(item.threadId);
     if (item.isSystemNotification) {
-      systemNotificationThreads.set(item.thread.getId(), item.thread);
+      systemNotificationThreads.add(item.threadId);
     } else {
       item.messageRecords.forEach(record => deletedMessageRecords.push(record));
     }
@@ -7360,35 +7372,41 @@ function movePendingMessagesToTrash(pendingDeletions) {
 
   for (const item of pendingMessages) {
     // Recheck in case the user manually trashed the message after collection.
-    if (item.message.isInTrash()) {
+    const currentMessage = executeGmailApiWithRetry_(() =>
+      Gmail.Users.Messages.get('me', item.message.id, { format: 'minimal' }),
+    );
+    if (messageHasLabel_(currentMessage, 'TRASH')) {
       verboseLog('TRASH MESSAGE SKIP', () => ({
-        messageId: item.message.getId(),
-        threadId: item.thread.getId(),
+        messageId: item.message.id,
+        threadId: item.threadId,
         reason: 'Message is already in Trash',
       }));
       continue;
     }
 
-    item.message.moveToTrash();
+    executeGmailApiWithRetry_(() =>
+      Gmail.Users.Messages.trash('me', item.message.id),
+    );
+    gmailThreadCache.delete(item.threadId);
     movedMessageCount += 1;
     if (item.isSystemNotification) {
       movedSystemMessageCount += 1;
     } else {
       movedOrdinaryMessageCount += 1;
     }
-    movedThreadIds.add(item.thread.getId());
+    movedThreadIds.add(item.threadId);
 
     if (item.isSystemNotification) {
-      systemNotificationThreads.set(item.thread.getId(), item.thread);
+      systemNotificationThreads.add(item.threadId);
     } else if (item.messageRecord) {
       deletedMessageRecords.push(item.messageRecord);
     }
   }
 
-  for (const thread of systemNotificationThreads.values()) {
+  for (const threadId of systemNotificationThreads.values()) {
     // Internal notifications are deliberately silent and leave no temporary
     // operational labels behind after their active messages reach Trash.
-    removeSystemNotificationLabels(thread);
+    removeSystemNotificationLabels(threadId);
   }
 
   return {
@@ -7407,19 +7425,16 @@ function movePendingMessagesToTrash(pendingDeletions) {
  * labels prevents the trashed summary from being rediscovered through
  * the configured notification-retention label on every run.
  *
- * @param {GmailThread} thread Generated notification thread.
+ * @param {string} threadId Generated notification thread ID.
  */
-function removeSystemNotificationLabels(thread) {
-  for (const label of thread.getLabels()) {
-    const labelName = label.getName();
-
-    if (
-      labelNamesEqual(labelName, getSystemNotificationLabelName()) ||
-      parseRetentionLabel(label) !== null
-    ) {
-      label.removeFromThread(thread);
-    }
-  }
+function removeSystemNotificationLabels(threadId) {
+  const labelsToRemove = getThreadUserLabels_(getGmailThread_(threadId, true))
+    .filter(label =>
+      labelNamesEqual(label.name, getSystemNotificationLabelName()) ||
+      parseRetentionLabel(label) !== null,
+    )
+    .map(label => label.id);
+  modifyThreadLabels_(threadId, [], labelsToRemove);
 }
 
 /**
@@ -7428,7 +7443,7 @@ function removeSystemNotificationLabels(thread) {
  * a system email is sent.
  */
 function deleteSystemNotificationLabelIfUnused() {
-  const systemLabel = GmailApiApp.getUserLabelByName(
+  const systemLabel = getGmailUserLabelByName_(
     getSystemNotificationLabelName(),
   );
 
@@ -7436,8 +7451,8 @@ function deleteSystemNotificationLabelIfUnused() {
     return;
   }
 
-  if (systemLabel.getThreads(0, 1).length === 0) {
-    systemLabel.deleteLabel();
+  if (listGmailThreadIds_(systemLabel.id, '', 1).length === 0) {
+    removeGmailLabel_(systemLabel.id);
     console.log(
       `Deleted unused internal label: ${getSystemNotificationLabelName()}`,
     );
@@ -7471,10 +7486,10 @@ function getSystemNotificationDeliveryContext() {
  * @param {string} subject Email subject.
  * @param {string} plainBody Plain-text fallback.
  * @param {string} htmlBody HTML email body.
- * @return {GmailMessage} Sent Gmail message.
+ * @return {Object} Sent Gmail API message resource.
  */
 function sendManagedSystemEmail(context, subject, plainBody, htmlBody) {
-  const sentMessage = GmailApiApp.sendMessage(
+  const sentMessage = sendGmailMessage_(
     context.recipient,
     subject,
     plainBody,
@@ -7483,17 +7498,15 @@ function sendManagedSystemEmail(context, subject, plainBody, htmlBody) {
       name: RETENTION_CONFIG.APPLICATION_NAME,
     },
   );
-  const notificationThread = sentMessage.getThread();
   const pendingEntry = {
-    messageId: sentMessage.getId(),
-    threadId: notificationThread.getId(),
-    systemLabelName: context.systemLabel.getName(),
-    retentionLabelName: context.notificationRetentionLabel.getName(),
+    messageId: sentMessage.id,
+    systemLabelName: context.systemLabel.name,
+    retentionLabelName: context.notificationRetentionLabel.name,
     sentAt: new Date().toISOString(),
   };
   rememberPendingManagedSystemEmail_(pendingEntry);
   try {
-    applyManagedSystemEmailState_(pendingEntry);
+    applyManagedSystemEmailState_(pendingEntry, true);
     forgetPendingManagedSystemEmail_(pendingEntry.messageId);
   } catch (error) {
     console.error(
@@ -7505,10 +7518,10 @@ function sendManagedSystemEmail(context, subject, plainBody, htmlBody) {
 
   verboseLog('SYSTEM EMAIL SENT', () => ({
     subject,
-    messageId: sentMessage.getId(),
-    threadId: notificationThread.getId(),
-    systemLabel: context.systemLabel.getName(),
-    retentionLabel: context.notificationRetentionLabel.getName(),
+    messageId: sentMessage.id,
+    threadId: sentMessage.threadId,
+    systemLabel: context.systemLabel.name,
+    retentionLabel: context.notificationRetentionLabel.name,
   }));
   return sentMessage;
 }
@@ -7538,7 +7551,6 @@ function sendDeletionSummaries(
   }));
   const deliveryContext = getSystemNotificationDeliveryContext();
   const timeZone = getConfiguredRetentionTimeZone();
-  const adminPageUrl = getAdminPageUrl();
   verboseLog('NOTIFICATION LABELS', () => ({
     recipient: deliveryContext.recipient,
     systemLabel: describeLabel(deliveryContext.systemLabel),
@@ -7546,7 +7558,6 @@ function sendDeletionSummaries(
       deliveryContext.notificationRetentionLabel,
     ),
     timeZone,
-    adminPageUrl,
     availableUpdate,
   }));
 
@@ -7587,7 +7598,6 @@ function sendDeletionSummaries(
       formattedRunDate,
       timeZone,
       availableUpdate,
-      adminPageUrl,
     );
     const htmlBody = buildHtmlSummary(
       chunk,
@@ -7597,11 +7607,10 @@ function sendDeletionSummaries(
       formattedRunDate,
       timeZone,
       availableUpdate,
-      adminPageUrl,
     );
 
     /*
-     * GmailDraft.send() returns the sent GmailMessage, allowing the script to
+     * The Gmail API returns the sent message resource, allowing the script to
      * label, place, and mark the generated notification without searching for it.
      */
     verboseLog('NOTIFICATION SEND', () => ({
@@ -7618,8 +7627,8 @@ function sendDeletionSummaries(
       htmlBody,
     );
     verboseLog('NOTIFICATION SENT', () => ({
-      messageId: sentMessage.getId(),
-      threadId: sentMessage.getThread().getId(),
+      messageId: sentMessage.id,
+      threadId: sentMessage.threadId,
     }));
     if (typeof onPartSent === 'function') {
       onPartSent(index + 1);
@@ -7651,7 +7660,6 @@ function sendUpdateOnlyNotificationIfNeeded(availableUpdate, runDate) {
 
   const deliveryContext = getSystemNotificationDeliveryContext();
   const timeZone = getConfiguredRetentionTimeZone();
-  const adminPageUrl = getAdminPageUrl();
   const formattedRunDate = Utilities.formatDate(
     runDate,
     timeZone,
@@ -7661,12 +7669,10 @@ function sendUpdateOnlyNotificationIfNeeded(availableUpdate, runDate) {
   const plainBody = buildPlainTextUpdateNotification(
     availableUpdate,
     formattedRunDate,
-    adminPageUrl,
   );
   const htmlBody = buildHtmlUpdateNotification(
     availableUpdate,
     formattedRunDate,
-    adminPageUrl,
   );
 
   sendManagedSystemEmail(deliveryContext, subject, plainBody, htmlBody);
@@ -7727,24 +7733,7 @@ function buildHtmlAvailableUpdateNotice(availableUpdate) {
     </div>`;
 }
 
-/** @return {string} Permanent HTML link to the private admin page. */
-function buildHtmlAdminPageLink(adminPageUrl) {
-  if (!adminPageUrl) {
-    return `
-      <p style="margin:16px 0 0;color:#5f6368;font-size:12px;">
-        The admin-page link is unavailable until this Apps Script project is
-        deployed as a web app.
-      </p>`;
-  }
-
-  return `
-    <p style="margin:16px 0 0;">
-      <a href="${escapeHtml(adminPageUrl)}" style="font-weight:700;">
-        Advanced Settings
-      </a>
-    </p>`;
-}
-
+/** @return {string} Reminder that settings now live in the Gmail card. */
 /** @return {string} HTML warning when verbose logging remains enabled. */
 function buildHtmlVerboseLoggingWarning() {
   if (!getRetentionSettings().VERBOSE_LOGGING) {
@@ -7772,6 +7761,33 @@ function getPlainTextVerboseLoggingWarningLines() {
     : [];
 }
 
+/** Shared footer for every HTML system notification. */
+function buildHtmlNotificationFooter_() {
+  return `
+    ${buildHtmlVerboseLoggingWarning()}
+    <p style="margin:16px 0 0;color:#5f6368;font-size:12px;">
+      Open Retention Manager from Gmail's add-on sidebar to manage settings.
+    </p>
+    <p style="margin:8px 0 0;color:#5f6368;font-size:12px;">
+      Generated by
+      <a href="${escapeHtml(RETENTION_CONFIG.PROJECT_REPOSITORY_URL)}">${escapeHtml(RETENTION_CONFIG.APPLICATION_NAME)}</a>
+      &middot;
+      <a href="${escapeHtml(getProjectReleaseUrl())}">v${escapeHtml(RETENTION_CONFIG.VERSION)}</a>
+    </p>`;
+}
+
+/** Shared footer lines for every plain-text system notification. */
+function getPlainTextNotificationFooterLines_() {
+  return [
+    ...getPlainTextVerboseLoggingWarningLines(),
+    '',
+    'Settings: Open Retention Manager from the Gmail add-on sidebar.',
+    `Generated by ${RETENTION_CONFIG.APPLICATION_NAME} ` +
+      `v${RETENTION_CONFIG.VERSION}: ${getProjectReleaseUrl()}`,
+    `Repository: ${RETENTION_CONFIG.PROJECT_REPOSITORY_URL}`,
+  ];
+}
+
 /**
  * Builds the HTML summary table.
  *
@@ -7782,7 +7798,6 @@ function getPlainTextVerboseLoggingWarningLines() {
  * @param {string} formattedRunDate Formatted execution date.
  * @param {string} timeZone Apps Script project time zone.
  * @param {Object|null} availableUpdate Newer GitHub release metadata, if any.
- * @param {string} adminPageUrl Deployed private admin-page URL.
  * @return {string} HTML email body.
  */
 function buildHtmlSummary(
@@ -7793,7 +7808,6 @@ function buildHtmlSummary(
   formattedRunDate,
   timeZone,
   availableUpdate,
-  adminPageUrl,
 ) {
   const rows = records.map((record, index) => {
     const received = Utilities.formatDate(
@@ -7856,14 +7870,7 @@ function buildHtmlSummary(
         moved to Trash silently when its retention period expires.
       </p>
       ${buildHtmlAvailableUpdateNotice(availableUpdate)}
-      ${buildHtmlVerboseLoggingWarning()}
-      ${buildHtmlAdminPageLink(adminPageUrl)}
-      <p style="margin:8px 0 0;color:#5f6368;font-size:12px;">
-        Generated by
-        <a href="${escapeHtml(RETENTION_CONFIG.PROJECT_REPOSITORY_URL)}">${escapeHtml(RETENTION_CONFIG.APPLICATION_NAME)}</a>
-        &middot;
-        <a href="${escapeHtml(getProjectReleaseUrl())}">v${escapeHtml(RETENTION_CONFIG.VERSION)}</a>
-      </p>
+      ${buildHtmlNotificationFooter_()}
     </div>`;
 }
 
@@ -7877,7 +7884,6 @@ function buildHtmlSummary(
  * @param {string} formattedRunDate Formatted execution date.
  * @param {string} timeZone Configured notification time zone.
  * @param {Object|null} availableUpdate Newer GitHub release metadata, if any.
- * @param {string} adminPageUrl Deployed private admin-page URL.
  * @return {string} Plain-text email body.
  */
 function buildPlainTextSummary(
@@ -7888,7 +7894,6 @@ function buildPlainTextSummary(
   formattedRunDate,
   timeZone,
   availableUpdate,
-  adminPageUrl,
 ) {
   const partText = totalParts > 1
     ? ` Part ${partNumber} of ${totalParts}.`
@@ -7934,22 +7939,7 @@ function buildPlainTextSummary(
     );
     lines.push(`Latest GitHub release: ${availableUpdate.releaseUrl}`);
   }
-  lines.push(...getPlainTextVerboseLoggingWarningLines());
-  lines.push('');
-  if (adminPageUrl) {
-    lines.push(`Advanced Settings: ${adminPageUrl}`);
-  } else {
-    lines.push(
-      'Admin page: unavailable until this Apps Script project is deployed as ' +
-        'a web app.',
-    );
-  }
-  lines.push(
-    `Generated by ${RETENTION_CONFIG.APPLICATION_NAME} ` +
-      `v${RETENTION_CONFIG.VERSION}: ` +
-    getProjectReleaseUrl(),
-  );
-  lines.push(`Repository: ${RETENTION_CONFIG.PROJECT_REPOSITORY_URL}`);
+  lines.push(...getPlainTextNotificationFooterLines_());
 
   return lines.join('\n');
 }
@@ -7959,13 +7949,11 @@ function buildPlainTextSummary(
  *
  * @param {Object} availableUpdate Newer GitHub release metadata.
  * @param {string} formattedRunDate Formatted detection time.
- * @param {string} adminPageUrl Deployed private admin-page URL.
  * @return {string} HTML email body.
  */
 function buildHtmlUpdateNotification(
   availableUpdate,
   formattedRunDate,
-  adminPageUrl,
 ) {
   return `
     <div style="font-family:Arial,sans-serif;font-size:14px;color:#202124;">
@@ -7996,14 +7984,7 @@ function buildHtmlUpdateNotification(
         ${escapeHtml(getNotificationRetentionLabelName())} and will be moved to
         Trash silently when its retention period expires.
       </p>
-      ${buildHtmlVerboseLoggingWarning()}
-      ${buildHtmlAdminPageLink(adminPageUrl)}
-      <p style="margin:8px 0 0;color:#5f6368;font-size:12px;">
-        Generated by
-        <a href="${escapeHtml(RETENTION_CONFIG.PROJECT_REPOSITORY_URL)}">${escapeHtml(RETENTION_CONFIG.APPLICATION_NAME)}</a>
-        &middot;
-        <a href="${escapeHtml(getProjectReleaseUrl())}">v${escapeHtml(RETENTION_CONFIG.VERSION)}</a>
-      </p>
+      ${buildHtmlNotificationFooter_()}
     </div>`;
 }
 
@@ -8012,13 +7993,11 @@ function buildHtmlUpdateNotification(
  *
  * @param {Object} availableUpdate Newer GitHub release metadata.
  * @param {string} formattedRunDate Formatted detection time.
- * @param {string} adminPageUrl Deployed private admin-page URL.
  * @return {string} Plain-text email body.
  */
 function buildPlainTextUpdateNotification(
   availableUpdate,
   formattedRunDate,
-  adminPageUrl,
 ) {
   const lines = [
     `${RETENTION_CONFIG.APPLICATION_NAME} Update Available`,
@@ -8035,22 +8014,8 @@ function buildPlainTextUpdateNotification(
     '',
     `This notification is labeled ${getNotificationRetentionLabelName()} and will be ` +
       'moved to Trash silently when its retention period expires.',
-    ...getPlainTextVerboseLoggingWarningLines(),
-    '',
+    ...getPlainTextNotificationFooterLines_(),
   ];
-
-  if (adminPageUrl) {
-    lines.push(`Advanced Settings: ${adminPageUrl}`);
-  } else {
-    lines.push(
-      'Admin page: unavailable until this Apps Script project is deployed as ' +
-        'a web app.',
-    );
-  }
-  lines.push(
-    `Current release: ${getProjectReleaseUrl()}`,
-    `Repository: ${RETENTION_CONFIG.PROJECT_REPOSITORY_URL}`,
-  );
   return lines.join('\n');
 }
 
@@ -8058,7 +8023,7 @@ function buildPlainTextUpdateNotification(
  * Returns an existing Gmail label or creates it when absent.
  *
  * @param {string} labelName Full Gmail label name.
- * @return {GmailLabel} Existing or newly created label.
+ * @return {Object} Existing or newly created Gmail API label resource.
  */
 function getOrCreateLabel(labelName) {
   const canonicalName = normalizeRetentionLabelName(labelName);
@@ -8094,10 +8059,10 @@ function getOrCreateLabel(labelName) {
 
     verboseLog('GET OR CREATE LABEL CREATE ATTEMPT', () => (currentPath));
     try {
-      deepestLabel = GmailApiApp.createLabel(currentPath);
+      deepestLabel = createGmailLabel_(currentPath);
     } catch (error) {
       console.error(
-        `GmailApiApp.createLabel(${JSON.stringify(currentPath)}) failed: ` +
+        `Creating Gmail label ${JSON.stringify(currentPath)} failed: ` +
           `${error && error.stack ? error.stack : error}`,
       );
       throw error;
@@ -8128,7 +8093,7 @@ function getOrCreateLabel(labelName) {
 
     if (!verifiedLabel) {
       throw new Error(
-        `GmailApiApp.createLabel() returned a label for ${currentPath}, but ` +
+        `The Gmail API returned a label for ${currentPath}, but ` +
           'the label could not be found during verification.',
       );
     }
@@ -8144,13 +8109,13 @@ function getOrCreateLabel(labelName) {
  * Finds a user label by full name using the cached case-insensitive label lookup.
  *
  * @param {string} labelName Full label path.
- * @return {GmailLabel|null} Matching label, or null when absent.
+ * @return {Object|null} Matching label resource, or null when absent.
  */
 function findUserLabelByName(labelName) {
   const normalizedTarget = normalizeRetentionLabelName(labelName).toLowerCase();
   verboseLog('FIND LABEL', () => ({ labelName, normalizedTarget }));
 
-  const match = GmailApiApp.getUserLabelByName(labelName);
+  const match = getGmailUserLabelByName_(labelName);
   verboseLog('FIND LABEL RESULT', () => describeLabel(match));
   return match;
 }
@@ -8221,10 +8186,10 @@ function verboseLabelSnapshot(step) {
 
   let labels;
   try {
-    labels = GmailApiApp.getUserLabels();
+    labels = getGmailUserLabels_();
   } catch (error) {
     console.error(
-      `[VERBOSE][${step}] GmailApiApp.getUserLabels() failed: ` +
+      `[VERBOSE][${step}] Listing Gmail labels failed: ` +
         `${error && error.stack ? error.stack : error}`,
     );
     throw error;
@@ -8234,18 +8199,17 @@ function verboseLabelSnapshot(step) {
     count: labels.length,
     labels: labels.map(label => ({
       id: safeGetLabelId(label),
-      rawName: label.getName(),
-      normalizedName: normalizeRetentionLabelName(label.getName()),
+      rawName: label.name,
+      normalizedName: normalizeRetentionLabelName(label.name),
       recognizedRetentionPolicy: Boolean(parseRetentionLabel(label)),
     })),
   }));
 }
 
 /**
- * Produces log-safe metadata for a GmailLabel without throwing when the input is
- * null or when a mock/test label does not implement getId().
+ * Produces log-safe metadata for a Gmail API label resource.
  *
- * @param {GmailLabel|null|undefined} label Label to describe.
+ * @param {Object|null|undefined} label Label resource to describe.
  * @return {Object|null} Serializable label metadata.
  */
 function describeLabel(label) {
@@ -8253,12 +8217,9 @@ function describeLabel(label) {
     return null;
   }
 
-  let name;
-  try {
-    name = label.getName();
-  } catch (error) {
-    name = '(unable to read label name)';
-  }
+  const name = typeof label.name === 'string'
+    ? label.name
+    : '(unable to read label name)';
 
   return {
     id: safeGetLabelId(label),
@@ -8270,19 +8231,11 @@ function describeLabel(label) {
 /**
  * Safely reads a Gmail label ID for diagnostics.
  *
- * @param {GmailLabel} label Gmail label.
+ * @param {Object} label Gmail API label resource.
  * @return {string|null} Label ID when available.
  */
 function safeGetLabelId(label) {
-  if (!label || typeof label.getId !== 'function') {
-    return null;
-  }
-
-  try {
-    return label.getId();
-  } catch (error) {
-    return null;
-  }
+  return label && typeof label.id === 'string' ? label.id : null;
 }
 
 /**
