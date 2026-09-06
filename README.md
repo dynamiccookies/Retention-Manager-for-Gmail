@@ -6,22 +6,23 @@
 
 Automatically move Gmail messages to Trash after a retention period defined by a Gmail label.
 
-Gmail filters decide **which conversations receive a retention policy**. Retention Manager decides **when those conversations expire**.
+Gmail filters decide **which messages receive a retention policy**. Retention Manager decides **when those messages expire**.
 
 > [!IMPORTANT]
-> Retention policies apply to entire Gmail conversations. A new reply resets the retention clock for the conversation. The application moves expired active messages to Trash; it does not permanently delete them.
+> New installations use **Message mode**, which evaluates each directly labeled message independently. **Thread mode** remains available when a user wants the newest message to control the entire conversation. The application moves eligible messages to Trash; it does not permanently delete them.
 
 ## Key features
 
 - Retention policies expressed in minutes, hours, days, weeks, calendar months, or calendar years
 - Policies applied manually, through Gmail filters, or in bulk
 - Managed schedules and manual **Run Now** processing
-- Gmail sidebar with status, schedule controls, and basic settings
-- Private administration page for complete configuration and diagnostics
+- Gmail sidebar with status, live scan progress, and complete settings
+- Native card pages for rules, schedules, notifications, labels, backups,
+  filter cleanup, and diagnostics
+- Selectable **Message mode** and **Thread mode** retention behavior
 - Automatic handling of multiple retention labels
-- Message-level processing for conversations containing both active and trashed messages
 - Deletion summaries with direct links to conversations in Gmail Trash
-- Automatic cleanup of the application’s notification messages
+- Separate result counts for ordinary messages moved and application notifications cleaned up
 - Safe suggestions for combining simple, redundant Gmail filters
 - Settings backups and validated configuration
 - Optional GitHub release checks
@@ -29,12 +30,14 @@ Gmail filters decide **which conversations receive a retention policy**. Retenti
 
 ## How it works
 
-1. Apply a retention label such as `Retention/7d` to a Gmail conversation.
+1. Apply a retention label such as `Retention/7d` to a Gmail message or conversation.
 2. A managed Apps Script trigger runs on the selected schedule.
-3. Retention Manager calculates expiration from the conversation’s newest message.
+3. Retention Manager uses the selected processing mode:
+   - **Message mode** calculates expiration for each directly labeled message.
+   - **Thread mode** calculates expiration from the conversation’s newest message.
 4. If multiple policies apply, the policy that expires latest wins.
 5. Expired active messages are moved to Trash.
-6. A deletion summary reports what was moved.
+6. A deletion summary reports ordinary messages moved; expired Retention Manager notifications are reported separately in the scan result.
 
 The scan schedule determines when expiration is checked. A seven-day policy does not guarantee processing at the exact moment seven days have passed.
 
@@ -42,10 +45,9 @@ The scan schedule determines when expiration is checked. A seven-day policy does
 
 Retention Manager is currently available as a manual Google Apps Script installation.
 
-The installation requires three files from the same published release:
+The installation requires two files from the same published release:
 
 - `retention-manager.gs`
-- `admin.html`
 - `appsscript.json`
 
 Follow the complete [Installation Guide](https://github.com/dynamiccookies/Retention-Manager-for-Gmail/wiki/Installation).
@@ -81,7 +83,7 @@ View the complete [GitHub Wiki](https://github.com/dynamiccookies/Retention-Mana
 
 ## Permissions and privacy
 
-Retention Manager uses Gmail access to read labels and message metadata, apply or remove labels, move eligible messages to Trash, and send summaries to the account that owns the installation.
+Retention Manager uses Gmail access to read labels and message metadata, apply or remove labels, move eligible messages to Trash, and send summaries to the account that owns the installation. Settings and recovery state are stored in that user's Apps Script User Properties; existing installations migrate automatically from the older script-wide property store.
 
 Gmail filter-management access is used only when the user explicitly operates Filter cleanup.
 
