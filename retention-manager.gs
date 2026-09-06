@@ -106,6 +106,18 @@ const RETENTION_FILTER_CLEANUP_HISTORY_LIMIT = 5;
 const RETENTION_FILTER_CLEANUP_PROPERTY_CHUNK_SIZE = 7500;
 const RETENTION_FILTER_CLEANUP_MAX_FILTERS_PER_MERGE = 25;
 const RETENTION_FILTER_CLEANUP_MAX_QUERY_LENGTH = 1500;
+const RETENTION_FILTER_SETTINGS_SCOPE =
+  'https://www.googleapis.com/auth/gmail.settings.basic';
+
+/**
+ * Stops a filter-changing action and lets Google request the one granular
+ * permission that filters.create and filters.delete require.
+ */
+function requireRetentionFilterMutationScope_() {
+  ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, [
+    RETENTION_FILTER_SETTINGS_SCOPE,
+  ]);
+}
 
 /**
  * Returns the per-user property store and performs the one-time migration from
@@ -2763,6 +2775,7 @@ function createAndVerifyRetentionFilter_(resource) {
  * Creates and verifies a replacement before removing the selected originals.
  */
 function mergeRetentionFilters(request) {
+  requireRetentionFilterMutationScope_();
   assertInstallationOwnerAccess();
   if (!isConfigurationObject(request) || typeof request.suggestionId !== 'string') {
     throw new Error('Select a valid filter-cleanup suggestion.');
@@ -2850,6 +2863,7 @@ function mergeRetentionFilters(request) {
 
 /** Restores the most recently consolidated group and removes its replacement. */
 function undoLastRetentionFilterMerge() {
+  requireRetentionFilterMutationScope_();
   assertInstallationOwnerAccess();
   const lock = LockService.getUserLock();
   lock.waitLock(10000);
@@ -3863,6 +3877,9 @@ function refreshRetentionCardFilters() {
 }
 
 function mergeRetentionCardFilters(event) {
+  // Keep this outside runRetentionCardOperation_ so its error handler cannot
+  // replace Google's authorization prompt with an ordinary card notification.
+  requireRetentionFilterMutationScope_();
   return runRetentionCardOperation_('filters', result => result.message, () =>
     mergeRetentionFilters({
       suggestionId: getSidebarActionParameter_(event, 'suggestionId', ''),
@@ -3871,6 +3888,8 @@ function mergeRetentionCardFilters(event) {
 }
 
 function undoRetentionCardFilterMerge() {
+  // Undo recreates original filters and deletes the combined replacement.
+  requireRetentionFilterMutationScope_();
   return runRetentionCardOperation_(
     'filters',
     result => result.message,
